@@ -1,8 +1,5 @@
 """
-health.py — HTTP health-check server for Fly.io.
-
-Fly.io pings /health every 30s. If it fails — machine restarts.
-Also serves GET / for convenience.
+health.py — HTTP health-check server for Fly.io + cycle stats.
 """
 
 import time
@@ -14,8 +11,10 @@ from bot.config import HEALTH_PORT, SOURCE_CHANNELS, LANGUAGES
 
 log = logging.getLogger("tg-aggregator")
 
-# Updated by main loop after each cycle
 last_cycle_ts: float = 0.0
+last_cycle_published: int = 0
+last_cycle_errors: int = 0
+total_published: int = 0
 
 
 async def _handler(request: web.Request) -> web.Response:
@@ -23,6 +22,9 @@ async def _handler(request: web.Request) -> web.Response:
     return web.json_response({
         "status": "ok",
         "last_cycle_secs_ago": round(ago, 1),
+        "last_cycle_published": last_cycle_published,
+        "last_cycle_errors": last_cycle_errors,
+        "total_published": total_published,
         "sources": len(SOURCE_CHANNELS),
         "targets": len(LANGUAGES),
     })

@@ -1,14 +1,11 @@
 """
-state.py — Deduplication state (JSON files on disk).
+state.py — Deduplication and retry state.
 
-Two layers of dedup:
-  1. By post_id (per language) — skip already-processed posts
-  2. By content hash (per language) — skip duplicate text across channels
-
-Edit this file to:
-  - Switch to SQLite for faster lookups
-  - Add Redis support for multi-instance setups
-  - Change retention (currently keeps last 5000 entries)
+Three layers:
+  1. seen: post_id was processed (won't re-translate)
+  2. published: post_id was successfully sent to TG
+  3. content_hashes: MD5 of text to catch cross-channel duplicates
+  4. failed: post_ids that failed, with retry count
 """
 
 import hashlib
@@ -17,61 +14,112 @@ import logging
 import re
 from pathlib import Path
 
-from bot.config import DATA_DIR
+from bot.config import DATA_DIR, MAX_RETRIES
 
 log = logging.getLogger("tg-aggregator")
 
-MAX_IDS = 5000  # keep last N entries per language
+MAX_IDS = 5000
 
 
-def _state_path(lang_code: str) -> Path:
-    return DATA_DIR / f"seen_{lang_code.lower()}.json"
+def _path(prefix: str, lang_code: str) -> Path:
+    return DATA_DIR / f"{prefix}_{lang_code.lower()}.json"
 
 
-def _hashes_path(lang_code: str) -> Path:
-    return DATA_DIR / f"hashes_{lang_code.lower()}.json"
+def _load_set(prefix: str, lang_code: str) -> set[str]:
+    p = _path(prefix, lang_code)
+    if p.exists():
+        try:
+            return set(json.loads(p.read_text()))
+        except Exception:
+            log.warning("Corrupt %s file for %s, resetting", prefix, lang_code)
+    return set()
 
+
+def _save_set(prefix: str, lang_code: str, data: set[str]):
+    p = _path(prefix, lang_code)
+    p.write_text(json.dumps(sorted(data)[-MAX_IDS:]))
+
+
+def _load_dict(prefix: str, lang_code: str) -> dict:
+    p = _path(prefix, lang_code)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            log.warning("Corrupt %s file for %s, resetting", prefix, lang_code)
+    return {}
+
+
+def _save_dict(prefix: str, lang_code: str, data: dict):
+    p = _path(prefix, lang_code)
+    # Trim to last MAX_IDS entries
+    if len(data) > MAX_IDS:
+        keys = sorted(data.keys())[-MAX_IDS:]
+        data = {k: data[k] for k in keys}
+    p.write_text(json.dumps(data))
+
+
+# ─── Seen (processed) ────────────────────────────────────────────────────────
 
 def load_seen(lang_code: str) -> set[str]:
-    p = _state_path(lang_code)
-    if p.exists():
-        try:
-            return set(json.loads(p.read_text()))
-        except Exception:
-            log.warning("Corrupt state file %s, resetting", p)
-    return set()
-
+    return _load_set("seen", lang_code)
 
 def save_seen(lang_code: str, seen: set[str]):
-    p = _state_path(lang_code)
-    p.write_text(json.dumps(sorted(seen)[-MAX_IDS:]))
+    _save_set("seen", lang_code, seen)
 
+
+# ─── Published (successfully sent) ───────────────────────────────────────────
+
+def load_published(lang_code: str) -> set[str]:
+    return _load_set("published", lang_code)
+
+def save_published(lang_code: str, published: set[str]):
+    _save_set("published", lang_code, published)
+
+
+# ─── Content hashes (cross-channel dedup) ────────────────────────────────────
 
 def load_content_hashes(lang_code: str) -> set[str]:
-    p = _hashes_path(lang_code)
-    if p.exists():
-        try:
-            return set(json.loads(p.read_text()))
-        except Exception:
-            log.warning("Corrupt hashes file %s, resetting", p)
-    return set()
-
+    return _load_set("hashes", lang_code)
 
 def save_content_hashes(lang_code: str, hashes: set[str]):
-    p = _hashes_path(lang_code)
-    p.write_text(json.dumps(sorted(hashes)[-MAX_IDS:]))
-
+    _save_set("hashes", lang_code, hashes)
 
 def content_hash(text: str) -> str:
-    """Generate a hash of the post text, ignoring whitespace differences."""
     normalized = re.sub(r'\s+', ' ', text.strip().lower())
     return hashlib.md5(normalized.encode()).hexdigest()
 
 
+# ─── Failed posts (retry tracking) ───────────────────────────────────────────
+
+def load_failed(lang_code: str) -> dict[str, int]:
+    """Returns {post_id: retry_count}."""
+    return _load_dict("failed", lang_code)
+
+def save_failed(lang_code: str, failed: dict[str, int]):
+    _save_dict("failed", lang_code, failed)
+
+def mark_failed(lang_code: str, post_id: str):
+    """Increment retry counter for a failed post."""
+    failed = load_failed(lang_code)
+    failed[post_id] = failed.get(post_id, 0) + 1
+    save_failed(lang_code, failed)
+
+def get_retryable(lang_code: str) -> list[str]:
+    """Get post_ids that can still be retried."""
+    failed = load_failed(lang_code)
+    return [pid for pid, count in failed.items() if count < MAX_RETRIES]
+
+def clear_failed(lang_code: str, post_id: str):
+    """Remove post from failed after successful retry."""
+    failed = load_failed(lang_code)
+    failed.pop(post_id, None)
+    save_failed(lang_code, failed)
+
+
+# ─── First run check ─────────────────────────────────────────────────────────
+
 def has_any_state() -> bool:
-    """True if at least one state file exists (not first run)."""
-    return any(
-        (DATA_DIR / f).exists()
-        for f in DATA_DIR.iterdir()
-        if f.name.startswith("seen_")
-    ) if DATA_DIR.exists() else False
+    if not DATA_DIR.exists():
+        return False
+    return any(f.name.startswith("seen_") for f in DATA_DIR.iterdir())

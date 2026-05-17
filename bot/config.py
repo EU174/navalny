@@ -1,10 +1,5 @@
 """
-config.py — Settings, channels, languages.
-
-Edit this file to:
-  - Add/remove source channels
-  - Add/change target languages
-  - Tweak polling interval, limits
+config.py — Settings, channels, languages, glossary.
 """
 
 import os
@@ -15,6 +10,7 @@ from pathlib import Path
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY", "")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")  # your TG user id for alerts
 
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "900"))  # seconds
 HEALTH_PORT = int(os.environ.get("PORT", "8080"))
@@ -22,35 +18,43 @@ HEALTH_PORT = int(os.environ.get("PORT", "8080"))
 MIN_POST_LENGTH = 50
 CAPTION_LIMIT = 1024
 MESSAGE_LIMIT = 4096
+MAX_RETRIES = 3  # retry failed posts up to N times
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# ─── Source channels to monitor ──────────────────────────────────────────────
+# ─── Source channels ─────────────────────────────────────────────────────────
 
 SOURCE_CHANNELS = [
-    "leonid_volkov",             # Леонид Волков
-    "yulia_navalnaya_channel",   # Юлия Навальная
-    "teamnavalny",               # Команда Навального
-    "anti_edro",                 # Анти-ЕдРо
-    "navalnylivechannel",        # Навальный LIVE
-    "lawfbk",                    # ФБК Юристы
-    "mariapevchikh",             # Мария Певчих
+    "leonid_volkov",
+    "yulia_navalnaya_channel",
+    "teamnavalny",
+    "anti_edro",
+    "navalnylivechannel",
+    "lawfbk",
+    "mariapevchikh",
 ]
 
-# ─── Target languages ───────────────────────────────────────────────────────
+# ─── Glossary: never translate these terms ───────────────────────────────────
+# These get wrapped in <keep> tags before translation and unwrapped after.
 
-@dataclass
-class LangConfig:
-    code: str               # DeepL target_lang
-    chat_id: str            # Telegram @channel or numeric chat_id
-    source_label: str       # "Quelle" / "Source"
-    part2_label: str        # "Teil 2" / "Part 2" / "Partie 2"
-    channel_name: str       # Display name for the target channel
-    name_fixes: dict = field(default_factory=dict)
+GLOSSARY = [
+    # People
+    "Навальный", "Навальная", "Навального", "Навальной", "Навальному",
+    "Navalny", "Navalnaya", "Nawalny", "Nawalnaja",
+    "Волков", "Волкова", "Волкову",
+    "Певчих",
+    "Жданов", "Жданова",
+    "Шаведдинов", "Шаведдинова",
+    # Organizations
+    "ФБК", "FBK", "АСФ", "ACF",
+    "Единая Россия", "ЕдРо",
+    "Команда Навального", "Team Navalny",
+    # Hashtags (pattern handled separately in translator.py)
+]
 
-# Display names for source channels per language
-# Used in footer: "Команда Навального" as a hyperlink
+# ─── Channel display names per language ──────────────────────────────────────
+
 CHANNEL_NAMES = {
     "DE": {
         "leonid_volkov":           "Leonid Wolkow",
@@ -81,6 +85,17 @@ CHANNEL_NAMES = {
     },
 }
 
+# ─── Target languages ────────────────────────────────────────────────────────
+
+@dataclass
+class LangConfig:
+    code: str
+    chat_id: str
+    source_label: str
+    part2_label: str
+    channel_name: str
+    name_fixes: dict = field(default_factory=dict)
+
 LANGUAGES = [
     LangConfig(
         code="DE",
@@ -89,13 +104,10 @@ LANGUAGES = [
         part2_label="Teil 2",
         channel_name="Nawalny Deutsch",
         name_fixes={
-            "Navalny": "Nawalny",
-            "navalny": "nawalny",
-            "Navalnaya": "Nawalnaja",
-            "navalnaya": "nawalnaja",
+            "Navalny": "Nawalny", "navalny": "nawalny",
+            "Navalnaya": "Nawalnaja", "navalnaya": "nawalnaja",
             "Navalniy": "Nawalny",
-            "Навальный": "Nawalny",
-            "Навальная": "Nawalnaja",
+            "Навальный": "Nawalny", "Навальная": "Nawalnaja",
         },
     ),
     LangConfig(
@@ -105,27 +117,21 @@ LANGUAGES = [
         part2_label="Part 2",
         channel_name="Navalny English",
         name_fixes={
-            "Nawalny": "Navalny",
-            "nawalny": "navalny",
-            "Nawalnaja": "Navalnaya",
-            "nawalnaja": "navalnaya",
-            "Навальный": "Navalny",
-            "Навальная": "Navalnaya",
+            "Nawalny": "Navalny", "nawalny": "navalny",
+            "Nawalnaja": "Navalnaya", "nawalnaja": "navalnaya",
+            "Навальный": "Navalny", "Навальная": "Navalnaya",
         },
     ),
     LangConfig(
         code="FR",
         chat_id=os.environ.get("TG_CHAT_FR", "@navalnyfrancais"),
-        source_label="Source\u00a0",  # non-breaking space before ':'
+        source_label="Source\u00a0",
         part2_label="Partie 2",
         channel_name="Navalny Français",
         name_fixes={
-            "Nawalny": "Navalny",
-            "nawalny": "navalny",
-            "Nawalnaja": "Navalnaya",
-            "nawalnaja": "navalnaya",
-            "Навальный": "Navalny",
-            "Навальная": "Navalnaya",
+            "Nawalny": "Navalny", "nawalny": "navalny",
+            "Nawalnaja": "Navalnaya", "nawalnaja": "navalnaya",
+            "Навальный": "Navalny", "Навальная": "Navalnaya",
         },
     ),
 ]

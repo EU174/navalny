@@ -1,22 +1,56 @@
 """
 translator.py — DeepL (primary) + Google Translate (fallback).
-
-Edit this file to:
-  - Switch to DeepL Pro API (change URL)
-  - Add another fallback (LibreTranslate, etc.)
-  - Tweak name transliteration rules
-  - Add glossary / do-not-translate lists
+Glossary protection: wraps terms and hashtags so they aren't translated.
 """
 
 import logging
+import re
 from typing import Optional
 
 import aiohttp
 
-from bot.config import DEEPL_API_KEY, LangConfig
+from bot.config import DEEPL_API_KEY, GLOSSARY, LangConfig
 from bot.scraper import clean_html
 
 log = logging.getLogger("tg-aggregator")
+
+# Placeholder markers for glossary terms
+_GLOSS_PREFIX = "\u2063GLOSS"  # invisible separator + GLOSS
+_GLOSS_SUFFIX = "SSOLG\u2063"
+
+
+def _protect_glossary(text: str) -> tuple[str, dict]:
+    """Wrap glossary terms and hashtags in markers so DeepL skips them."""
+    replacements = {}
+    counter = 0
+
+    # Protect hashtags first (#протест, #FreeNavalny, etc.)
+    def _replace_hashtag(m):
+        nonlocal counter
+        key = f"{_GLOSS_PREFIX}{counter}{_GLOSS_SUFFIX}"
+        replacements[key] = m.group(0)
+        counter += 1
+        return key
+    text = re.sub(r"#\w+", _replace_hashtag, text)
+
+    # Protect glossary terms (longest first to avoid partial matches)
+    for term in sorted(GLOSSARY, key=len, reverse=True):
+        if term in text:
+            key = f"{_GLOSS_PREFIX}{counter}{_GLOSS_SUFFIX}"
+            replacements[key] = term
+            text = text.replace(term, key)
+            counter += 1
+
+    return text, replacements
+
+
+def _restore_glossary(text: str, replacements: dict) -> str:
+    """Restore original terms from markers."""
+    for key, original in replacements.items():
+        text = text.replace(key, original)
+    # Clean up any leftover markers
+    text = re.sub(rf"{re.escape(_GLOSS_PREFIX)}\d+{re.escape(_GLOSS_SUFFIX)}", "", text)
+    return text
 
 
 async def translate_deepl(
@@ -26,14 +60,13 @@ async def translate_deepl(
     if not DEEPL_API_KEY:
         return None
 
-    # Free: api-free.deepl.com  |  Pro: api.deepl.com
     url = "https://api-free.deepl.com/v2/translate"
     payload = {
         "text": [text],
         "source_lang": "RU",
         "target_lang": target_lang,
         "tag_handling": "html",
-        "ignore_tags": ["a"],
+        "ignore_tags": ["a", "code", "pre"],
     }
     headers = {"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"}
     try:
@@ -80,16 +113,26 @@ def apply_name_fixes(text: str, lang: LangConfig) -> str:
 async def translate(
     session: aiohttp.ClientSession, text: str, lang: LangConfig
 ) -> str:
-    """Translate text with fallback chain: DeepL → Google → original."""
-    translated = await translate_deepl(session, text, lang.code)
+    """Translate with glossary protection and fallback chain."""
+    # Protect glossary terms and hashtags
+    protected_text, replacements = _protect_glossary(text)
+
+    translated = await translate_deepl(session, protected_text, lang.code)
 
     if translated is None:
         log.info("DeepL unavailable, trying Google Translate for %s", lang.code)
-        translated = await translate_google(session, text, lang.code)
+        # Strip HTML for Google (it doesn't handle tags well)
+        plain = re.sub(r"<[^>]+>", "", protected_text)
+        translated = await translate_google(session, plain, lang.code)
 
     if translated is None:
         log.error("All translation backends failed for %s", lang.code)
         return text  # return original as last resort
 
+    # Restore glossary terms
+    translated = _restore_glossary(translated, replacements)
+
+    # Apply name transliteration fixes
     translated = apply_name_fixes(translated, lang)
+
     return clean_html(translated)
