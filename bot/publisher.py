@@ -1,7 +1,11 @@
 """
 publisher.py — Send translated posts to Telegram channels.
-Supports photos, albums, video references. Fallback to plain text on HTML errors.
-Sends admin alerts on repeated failures.
+
+Strategy:
+  1. If post has media (photo/video/album) → forwardMessage original, then send translation
+  2. If text-only → send translated text with header + footer
+  3. Fallback to plain text if HTML fails
+  4. Admin alerts on repeated failures
 """
 
 import asyncio
@@ -60,7 +64,6 @@ async def send_admin_alert(session: aiohttp.ClientSession, message: str):
 
 
 async def track_failure(session: aiohttp.ClientSession, post_id: str, error: str):
-    """Track failures and alert admin if threshold exceeded."""
     global _consecutive_failures
     _consecutive_failures += 1
     if _consecutive_failures >= _ALERT_THRESHOLD:
@@ -69,7 +72,7 @@ async def track_failure(session: aiohttp.ClientSession, post_id: str, error: str
             f"🔴 {_consecutive_failures} consecutive publish failures!\n"
             f"Last: {post_id}\nError: {error}"
         )
-        _consecutive_failures = 0  # reset after alert
+        _consecutive_failures = 0
 
 
 def reset_failure_counter():
@@ -78,7 +81,7 @@ def reset_failure_counter():
 
 
 def _sanitize_html(text: str) -> str:
-    """Last-resort: if HTML is severely broken, strip all tags."""
+    """If HTML is severely broken, strip all tags."""
     opens = len(re.findall(r"<[a-zA-Z]", text))
     closes = len(re.findall(r"</[a-zA-Z]", text))
     if abs(opens - closes) > 3:
@@ -88,7 +91,7 @@ def _sanitize_html(text: str) -> str:
 
 
 def _build_header(post: Post, lang: LangConfig) -> str:
-    """Channel name at the top of the post."""
+    """Channel name at the top, bold with link to channel."""
     names = CHANNEL_NAMES.get(lang.code, {})
     display_name = names.get(post.channel, f"@{post.channel}")
     channel_url = f"https://t.me/{post.channel}"
@@ -104,6 +107,7 @@ def _build_footer(post: Post, lang: LangConfig) -> str:
 
 
 def _split_message(text: str, limit: int) -> list[str]:
+    """Split at paragraph boundaries first, then line breaks, then spaces."""
     if len(text) <= limit:
         return [text]
     chunks: list[str] = []
@@ -111,24 +115,27 @@ def _split_message(text: str, limit: int) -> list[str]:
         if len(text) <= limit:
             chunks.append(text)
             break
+        # Try paragraph break
         cut = text[:limit].rsplit("\n\n", 1)
         if len(cut) == 2 and len(cut[0]) > limit // 3:
             chunks.append(cut[0])
             text = cut[1]
-        else:
-            cut = text[:limit].rsplit("\n", 1)
-            if len(cut) == 2 and len(cut[0]) > limit // 3:
-                chunks.append(cut[0])
-                text = cut[1]
-            else:
-                cut = text[:limit].rsplit(" ", 1)
-                chunks.append(cut[0])
-                text = cut[1] if len(cut) == 2 else ""
+            continue
+        # Try line break
+        cut = text[:limit].rsplit("\n", 1)
+        if len(cut) == 2 and len(cut[0]) > limit // 3:
+            chunks.append(cut[0])
+            text = cut[1]
+            continue
+        # Try space
+        cut = text[:limit].rsplit(" ", 1)
+        chunks.append(cut[0])
+        text = cut[1] if len(cut) == 2 else ""
     return chunks
 
 
 async def _send_text(session, chat_id: str, text: str) -> bool:
-    """Send text message. Fallback to plain text if HTML fails. Returns success."""
+    """Send text message. Fallback to plain text if HTML fails."""
     result = await tg_request(
         session, "sendMessage",
         chat_id=chat_id,
@@ -151,61 +158,22 @@ async def _send_text(session, chat_id: str, text: str) -> bool:
     return False
 
 
-async def _send_photo(session, chat_id: str, photo_url: str,
-                      caption: str) -> bool:
-    """Send photo with caption. Returns success."""
+async def _forward_original(
+    session: aiohttp.ClientSession,
+    post: Post,
+    chat_id: str,
+) -> bool:
+    """Forward original post from source channel (preserves all media)."""
+    from_chat = f"@{post.channel}"
     result = await tg_request(
-        session, "sendPhoto",
+        session, "forwardMessage",
         chat_id=chat_id,
-        photo=photo_url,
-        caption=caption,
-        parse_mode="HTML",
+        from_chat_id=from_chat,
+        message_id=post.message_id,
     )
     if result is not None:
         return True
-    # Retry caption without HTML
-    if "<" in caption:
-        plain = re.sub(r"<[^>]+>", "", caption)
-        result = await tg_request(
-            session, "sendPhoto",
-            chat_id=chat_id,
-            photo=photo_url,
-            caption=plain,
-        )
-        if result is not None:
-            return True
-    return False
-
-
-async def _send_album(session, chat_id: str, photos: list[str],
-                      caption: str) -> bool:
-    """Send media group (album). Caption on first photo."""
-    media = []
-    for i, url in enumerate(photos[:10]):  # TG limit: 10 media per group
-        item = {"type": "photo", "media": url}
-        if i == 0:
-            item["caption"] = caption
-            item["parse_mode"] = "HTML"
-        media.append(item)
-
-    result = await tg_request(
-        session, "sendMediaGroup",
-        chat_id=chat_id,
-        media=media,
-    )
-    if result is not None:
-        return True
-    # Fallback: retry first photo with plain caption
-    if "<" in caption:
-        media[0]["caption"] = re.sub(r"<[^>]+>", "", caption)
-        del media[0]["parse_mode"]
-        result = await tg_request(
-            session, "sendMediaGroup",
-            chat_id=chat_id,
-            media=media,
-        )
-        if result is not None:
-            return True
+    log.warning("forwardMessage failed for %s to %s", post.post_id, chat_id)
     return False
 
 
@@ -215,68 +183,44 @@ async def publish_post(
     translated_html: str,
     lang: LangConfig,
 ) -> bool:
-    """Send one translated post. Returns True if published successfully."""
+    """
+    Publish strategy:
+      - Media posts: forward original (keeps video/photo/album) + send translation below
+      - Text-only: send translated text with header + footer
+    """
     translated_html = _sanitize_html(translated_html)
     header = _build_header(post, lang)
     footer = _build_footer(post, lang)
-    full_text = header + translated_html + footer
+    translation_text = header + translated_html + footer
 
     success = False
 
-    # Album (multiple photos)
-    if post.album_photos and len(post.album_photos) > 1:
-        if len(full_text) <= CAPTION_LIMIT:
-            success = await _send_album(session, lang.chat_id, post.album_photos, full_text)
-        else:
-            # Caption too long: send album with short caption, then text
-            short = header + translated_html[:CAPTION_LIMIT - len(header) - len(footer) - 10]
-            short = short.rsplit(" ", 1)[0] + "…" + footer
-            success = await _send_album(session, lang.chat_id, post.album_photos, short)
-            if success:
-                await asyncio.sleep(0.5)
-                remainder = f"<b>{lang.part2_label}</b>\n\n" + translated_html + footer
-                for chunk in _split_message(remainder, MESSAGE_LIMIT):
-                    await _send_text(session, lang.chat_id, chunk)
-                    await asyncio.sleep(0.3)
-        # Fallback: if album fails, try single photo
-        if not success and post.album_photos:
-            log.info("Album failed, trying single photo for %s", post.post_id)
-            success = await _send_photo(session, lang.chat_id, post.album_photos[0],
-                                        full_text if len(full_text) <= CAPTION_LIMIT else header + footer)
+    if post.has_media:
+        # Step 1: Forward original post (preserves all media)
+        fwd_ok = await _forward_original(session, post, lang.chat_id)
 
-    # Single photo
-    elif post.photo_url and post.video_url != "preview_only":
-        if len(full_text) <= CAPTION_LIMIT:
-            success = await _send_photo(session, lang.chat_id, post.photo_url, full_text)
-            if not success:
-                log.info("Photo failed, sending as text for %s", post.post_id)
-                success = await _send_text(session, lang.chat_id, full_text)
-        else:
-            cutoff = CAPTION_LIMIT - len(header) - len(footer) - 10
-            part1 = header + translated_html[:cutoff].rsplit(" ", 1)[0] + "…" + footer
-            success = await _send_photo(session, lang.chat_id, post.photo_url, part1)
-            if not success:
-                success = await _send_text(session, lang.chat_id, part1)
+        if fwd_ok:
             await asyncio.sleep(0.5)
-            part2 = f"<b>{lang.part2_label}</b>\n\n" + translated_html[cutoff:] + footer
-            for chunk in _split_message(part2, MESSAGE_LIMIT):
-                await _send_text(session, lang.chat_id, chunk)
+            # Step 2: Send translation as reply-like text below
+            for chunk in _split_message(translation_text, MESSAGE_LIMIT):
+                s = await _send_text(session, lang.chat_id, chunk)
+                if s:
+                    success = True
                 await asyncio.sleep(0.3)
-            success = True  # at least text part sent
+        else:
+            # Fallback: forward failed, send text-only with link to original
+            log.info("Forward failed for %s, sending text with media link", post.post_id)
+            media_link = f'\n\n🎬 <a href="https://t.me/{post.post_id}">Original post</a>'
+            text_with_link = translation_text + media_link
+            for chunk in _split_message(text_with_link, MESSAGE_LIMIT):
+                s = await _send_text(session, lang.chat_id, chunk)
+                if s:
+                    success = True
+                await asyncio.sleep(0.3)
 
-    # Video post (can't forward video from preview, send as text with link)
-    elif post.video_url:
-        video_note = f'\n\n🎬 <a href="https://t.me/{post.post_id}">Video</a>'
-        text_with_video = full_text + video_note
-        for chunk in _split_message(text_with_video, MESSAGE_LIMIT):
-            s = await _send_text(session, lang.chat_id, chunk)
-            if s:
-                success = True
-            await asyncio.sleep(0.3)
-
-    # Text only
     else:
-        for chunk in _split_message(full_text, MESSAGE_LIMIT):
+        # Text-only post: just send translation
+        for chunk in _split_message(translation_text, MESSAGE_LIMIT):
             s = await _send_text(session, lang.chat_id, chunk)
             if s:
                 success = True
