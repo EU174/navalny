@@ -1,11 +1,5 @@
 """
-state.py — Deduplication and retry state.
-
-Three layers:
-  1. seen: post_id was processed (won't re-translate)
-  2. published: post_id was successfully sent to TG
-  3. content_hashes: MD5 of text to catch cross-channel duplicates
-  4. failed: post_ids that failed, with retry count
+state.py — Deduplication, retry tracking, content hashing.
 """
 
 import hashlib
@@ -52,14 +46,11 @@ def _load_dict(prefix: str, lang_code: str) -> dict:
 
 def _save_dict(prefix: str, lang_code: str, data: dict):
     p = _path(prefix, lang_code)
-    # Trim to last MAX_IDS entries
     if len(data) > MAX_IDS:
         keys = sorted(data.keys())[-MAX_IDS:]
         data = {k: data[k] for k in keys}
     p.write_text(json.dumps(data))
 
-
-# ─── Seen (processed) ────────────────────────────────────────────────────────
 
 def load_seen(lang_code: str) -> set[str]:
     return _load_set("seen", lang_code)
@@ -67,17 +58,11 @@ def load_seen(lang_code: str) -> set[str]:
 def save_seen(lang_code: str, seen: set[str]):
     _save_set("seen", lang_code, seen)
 
-
-# ─── Published (successfully sent) ───────────────────────────────────────────
-
 def load_published(lang_code: str) -> set[str]:
     return _load_set("published", lang_code)
 
 def save_published(lang_code: str, published: set[str]):
     _save_set("published", lang_code, published)
-
-
-# ─── Content hashes (cross-channel dedup) ────────────────────────────────────
 
 def load_content_hashes(lang_code: str) -> set[str]:
     return _load_set("hashes", lang_code)
@@ -89,35 +74,25 @@ def content_hash(text: str) -> str:
     normalized = re.sub(r'\s+', ' ', text.strip().lower())
     return hashlib.md5(normalized.encode()).hexdigest()
 
-
-# ─── Failed posts (retry tracking) ───────────────────────────────────────────
-
 def load_failed(lang_code: str) -> dict[str, int]:
-    """Returns {post_id: retry_count}."""
     return _load_dict("failed", lang_code)
 
 def save_failed(lang_code: str, failed: dict[str, int]):
     _save_dict("failed", lang_code, failed)
 
 def mark_failed(lang_code: str, post_id: str):
-    """Increment retry counter for a failed post."""
     failed = load_failed(lang_code)
     failed[post_id] = failed.get(post_id, 0) + 1
     save_failed(lang_code, failed)
 
 def get_retryable(lang_code: str) -> list[str]:
-    """Get post_ids that can still be retried."""
     failed = load_failed(lang_code)
     return [pid for pid, count in failed.items() if count < MAX_RETRIES]
 
 def clear_failed(lang_code: str, post_id: str):
-    """Remove post from failed after successful retry."""
     failed = load_failed(lang_code)
     failed.pop(post_id, None)
     save_failed(lang_code, failed)
-
-
-# ─── First run check ─────────────────────────────────────────────────────────
 
 def has_any_state() -> bool:
     if not DATA_DIR.exists():

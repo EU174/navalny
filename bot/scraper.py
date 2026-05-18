@@ -1,12 +1,11 @@
 """
 scraper.py — Fetch posts from public Telegram channel previews.
-Detects media (photo/video/album) for forwardMessage strategy.
-Cleans up embed artifacts (YouTube buttons, link previews).
+Detects media, extracts message_id, cleans embed artifacts.
 """
 
 import re
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from html import escape as html_escape
 from typing import Optional
 
@@ -21,25 +20,23 @@ log = logging.getLogger("tg-aggregator")
 @dataclass
 class Post:
     channel: str
-    post_id: str          # e.g. "teamnavalny/1234"
-    message_id: int       # numeric part: 1234 (for forwardMessage)
-    text_html: str        # Telegram-compatible HTML
-    text_plain: str       # plain text
-    has_media: bool = False  # True if post has photo/video/album
+    post_id: str
+    message_id: int
+    text_html: str
+    text_plain: str
+    has_media: bool = False
+    youtube_id: Optional[str] = None  # for T11/T12
 
 
 # ─── HTML conversion ─────────────────────────────────────────────────────────
 
 def tg_html(el) -> str:
-    """Convert BeautifulSoup element to Telegram-compatible HTML."""
     if isinstance(el, NavigableString):
         return html_escape(str(el))
     if not isinstance(el, Tag):
         return ""
-
     tag = el.name
     inner = "".join(tg_html(c) for c in el.children)
-
     if tag == "br":
         return "\n"
     if tag in ("b", "strong"):
@@ -64,59 +61,35 @@ def tg_html(el) -> str:
     return inner
 
 
-def _clean_embed_artifacts(text: str) -> str:
-    """Remove YouTube/link preview button-like artifacts from parsed text.
-    These appear as 'Channel Name | Button Text' at the end of posts."""
-    # Remove lines that look like embed buttons: "❗️\nChannel | Action"
-    # or "ChannelName | Поддержать" / "| Support" etc.
-    lines = text.split("\n")
-    cleaned = []
-    skip_rest = False
-    for line in lines:
-        stripped = line.strip()
-        # Skip lines that are just emoji
-        if stripped and all(c in "❗️❤️🔥💪🎬📹📺🔴▶️⚡️" or ord(c) > 0x1F000 for c in stripped.replace(" ", "")):
-            continue
-        # Skip "Channel | Action" button lines
-        if re.match(r"^.{1,40}\s*\|\s*.{1,30}$", stripped) and not "<a " in stripped:
-            skip_rest = True
-            continue
-        if skip_rest:
-            continue
-        cleaned.append(line)
-
-    return "\n".join(cleaned)
+def _extract_youtube_id(text: str) -> Optional[str]:
+    """Extract YouTube video ID from text."""
+    m = re.search(
+        r"(?:youtu\.be/|youtube\.com/watch\?v=|youtube\.com/embed/)([a-zA-Z0-9_-]{11})",
+        text
+    )
+    return m.group(1) if m else None
 
 
 def clean_html(text: str) -> str:
-    """Strip unsupported tags, fix broken HTML, clean artifacts."""
+    """Strip unsupported tags, fix broken HTML, remove embed artifacts."""
     allowed = {"b", "strong", "i", "em", "u", "s", "strike", "del",
                "code", "pre", "a"}
 
-    # 1. Remove non-allowed tags
     def _strip(m):
         tag_name = m.group(1).strip().split()[0].lower().lstrip("/")
         return m.group(0) if tag_name in allowed else ""
     text = re.sub(r"<(/?\s*[a-zA-Z][^>]*)>", _strip, text)
-
-    # 2. Remove truncated tags
     text = re.sub(r"<[a-zA-Z][^>]*$", "", text)
-
-    # 3. Remove empty tags
     text = re.sub(r"<(\w+)[^>]*>\s*</\1>", "", text)
-
-    # 4. Remove <a> without href
     text = re.sub(r'<a(?:\s[^>]*)?>([^<]*)</a>', lambda m: (
         m.group(0) if 'href=' in m.group(0) else m.group(1)
     ), text)
 
-    # 5. Balance tags
     for tag in ["b", "i", "u", "s", "code", "pre"]:
         opens = len(re.findall(rf"<{tag}[\s>]", text, re.IGNORECASE))
         closes = len(re.findall(rf"</{tag}>", text, re.IGNORECASE))
         if opens > closes:
-            for _ in range(opens - closes):
-                text += f"</{tag}>"
+            text += f"</{tag}>" * (opens - closes)
         elif closes > opens:
             for _ in range(closes - opens):
                 text = re.sub(rf"</{tag}>", "", text, count=1)
@@ -124,20 +97,29 @@ def clean_html(text: str) -> str:
     a_opens = len(re.findall(r"<a[\s>]", text, re.IGNORECASE))
     a_closes = len(re.findall(r"</a>", text, re.IGNORECASE))
     if a_opens > a_closes:
-        for _ in range(a_opens - a_closes):
-            text += "</a>"
+        text += "</a>" * (a_opens - a_closes)
     elif a_closes > a_opens:
         for _ in range(a_closes - a_opens):
             text = re.sub(r"</a>", "", text, count=1)
 
-    # 6. Clean embed artifacts
-    text = _clean_embed_artifacts(text)
+    # T10: Remove embed/link-preview artifacts
+    lines = text.split("\n")
+    cleaned = []
+    for line in lines:
+        s = line.strip()
+        # Skip standalone emoji-only lines (embed icons)
+        if s and len(s) <= 3 and not s.isalnum():
+            plain = re.sub(r"<[^>]+>", "", s)
+            if all(ord(c) > 0x2000 or c in "❗️❤️🔥💪🎬📹📺🔴▶️⚡️" for c in plain.replace(" ", "")):
+                continue
+        # Skip "ChannelName | ButtonText" lines (embed buttons)
+        plain_line = re.sub(r"<[^>]+>", "", s)
+        if re.match(r"^.{1,40}\s*\|\s*.{1,30}$", plain_line):
+            continue
+        cleaned.append(line)
+    text = "\n".join(cleaned)
 
-    # 7. Normalize newlines: keep paragraph breaks, trim excess
     text = re.sub(r"\n{3,}", "\n\n", text)
-    # Ensure single \n stays (line breaks within paragraphs)
-    # Don't collapse \n to space
-
     return text.strip()
 
 
@@ -146,7 +128,6 @@ def clean_html(text: str) -> str:
 async def fetch_channel_posts(
     session: aiohttp.ClientSession, channel: str
 ) -> list[Post]:
-    """Scrape t.me/s/<channel> and return list of Posts."""
     url = f"https://t.me/s/{channel}"
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -169,16 +150,17 @@ async def fetch_channel_posts(
         data_post = msg.get("data-post", "")
         if "/" not in data_post:
             continue
-
-        # Extract numeric message_id
         try:
             message_id = int(data_post.split("/")[1])
         except (ValueError, IndexError):
             continue
 
-        # Skip forwards
         if msg.select_one("a.tgme_widget_message_forwarded_from_name"):
             continue
+
+        # T10: Remove link preview blocks BEFORE extracting text
+        for preview in msg.select("a.tgme_widget_message_link_preview"):
+            preview.decompose()
 
         text_div = msg.select_one("div.tgme_widget_message_text")
         if not text_div:
@@ -190,14 +172,15 @@ async def fetch_channel_posts(
         if len(text_plain) < MIN_POST_LENGTH:
             continue
 
-        # Detect any media
         has_photo = bool(msg.select_one("a.tgme_widget_message_photo_wrap"))
         has_video = bool(
             msg.select_one("video.tgme_widget_message_video")
             or msg.select_one("a.tgme_widget_message_video_wrap")
             or msg.select_one("i.tgme_widget_message_video_thumb")
         )
-        has_media = has_photo or has_video
+
+        # T11: Extract YouTube ID
+        youtube_id = _extract_youtube_id(text_plain)
 
         posts.append(Post(
             channel=channel,
@@ -205,7 +188,8 @@ async def fetch_channel_posts(
             message_id=message_id,
             text_html=text_html,
             text_plain=text_plain,
-            has_media=has_media,
+            has_media=has_photo or has_video,
+            youtube_id=youtube_id,
         ))
 
     log.info("Fetched %d posts from @%s", len(posts), channel)

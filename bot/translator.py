@@ -1,30 +1,56 @@
 """
-translator.py — DeepL (primary) + Google Translate (fallback).
-Glossary protection: wraps terms and hashtags so they aren't translated.
+translator.py — DeepL + Google fallback. Glossary protection. Translation cache.
 """
 
+import hashlib
+import json
 import logging
 import re
+from pathlib import Path
 from typing import Optional
 
 import aiohttp
 
-from bot.config import DEEPL_API_KEY, GLOSSARY, LangConfig
+from bot.config import DEEPL_API_KEY, GLOSSARY, DATA_DIR, LangConfig
 from bot.scraper import clean_html
 
 log = logging.getLogger("tg-aggregator")
 
-# Placeholder markers for glossary terms
-_GLOSS_PREFIX = "\u2063GLOSS"  # invisible separator + GLOSS
+_GLOSS_PREFIX = "\u2063GLOSS"
 _GLOSS_SUFFIX = "SSOLG\u2063"
+
+# T15: Translation cache dir
+_CACHE_DIR = DATA_DIR / "translation_cache"
+_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Track DeepL character usage
+deepl_chars_used: int = 0
+
+
+def _cache_key(text: str, lang_code: str) -> str:
+    h = hashlib.md5(f"{lang_code}:{text}".encode()).hexdigest()
+    return h
+
+
+def _cache_get(text: str, lang_code: str) -> Optional[str]:
+    key = _cache_key(text, lang_code)
+    p = _CACHE_DIR / f"{key}.txt"
+    if p.exists():
+        log.debug("Translation cache hit for %s", lang_code)
+        return p.read_text()
+    return None
+
+
+def _cache_set(text: str, lang_code: str, translated: str):
+    key = _cache_key(text, lang_code)
+    p = _CACHE_DIR / f"{key}.txt"
+    p.write_text(translated)
 
 
 def _protect_glossary(text: str) -> tuple[str, dict]:
-    """Wrap glossary terms and hashtags in markers so DeepL skips them."""
     replacements = {}
     counter = 0
 
-    # Protect hashtags first (#протест, #FreeNavalny, etc.)
     def _replace_hashtag(m):
         nonlocal counter
         key = f"{_GLOSS_PREFIX}{counter}{_GLOSS_SUFFIX}"
@@ -33,7 +59,6 @@ def _protect_glossary(text: str) -> tuple[str, dict]:
         return key
     text = re.sub(r"#\w+", _replace_hashtag, text)
 
-    # Protect glossary terms (longest first to avoid partial matches)
     for term in sorted(GLOSSARY, key=len, reverse=True):
         if term in text:
             key = f"{_GLOSS_PREFIX}{counter}{_GLOSS_SUFFIX}"
@@ -45,10 +70,8 @@ def _protect_glossary(text: str) -> tuple[str, dict]:
 
 
 def _restore_glossary(text: str, replacements: dict) -> str:
-    """Restore original terms from markers."""
     for key, original in replacements.items():
         text = text.replace(key, original)
-    # Clean up any leftover markers
     text = re.sub(rf"{re.escape(_GLOSS_PREFIX)}\d+{re.escape(_GLOSS_SUFFIX)}", "", text)
     return text
 
@@ -56,7 +79,7 @@ def _restore_glossary(text: str, replacements: dict) -> str:
 async def translate_deepl(
     session: aiohttp.ClientSession, text: str, target_lang: str
 ) -> Optional[str]:
-    """DeepL Free API. Returns None on any failure."""
+    global deepl_chars_used
     if not DEEPL_API_KEY:
         return None
 
@@ -77,6 +100,7 @@ async def translate_deepl(
                 log.warning("DeepL HTTP %d: %s", resp.status, body[:300])
                 return None
             data = await resp.json()
+            deepl_chars_used += len(text)
             return data["translations"][0]["text"]
     except Exception as e:
         log.error("DeepL error: %s", e)
@@ -86,7 +110,6 @@ async def translate_deepl(
 async def translate_google(
     session: aiohttp.ClientSession, text: str, target_lang: str
 ) -> Optional[str]:
-    """Google Translate (unofficial, no API key). Fallback only."""
     gl_map = {"DE": "de", "EN-GB": "en", "FR": "fr"}
     tl = gl_map.get(target_lang, target_lang.lower().split("-")[0])
     url = "https://translate.googleapis.com/translate_a/single"
@@ -104,7 +127,6 @@ async def translate_google(
 
 
 def apply_name_fixes(text: str, lang: LangConfig) -> str:
-    """Post-translation name transliteration corrections."""
     for src, dst in lang.name_fixes.items():
         text = text.replace(src, dst)
     return text
@@ -113,26 +135,31 @@ def apply_name_fixes(text: str, lang: LangConfig) -> str:
 async def translate(
     session: aiohttp.ClientSession, text: str, lang: LangConfig
 ) -> str:
-    """Translate with glossary protection and fallback chain."""
-    # Protect glossary terms and hashtags
+    """Translate with cache, glossary protection, and fallback chain."""
+    # T15: Check cache first
+    cached = _cache_get(text, lang.code)
+    if cached is not None:
+        log.info("Using cached translation for %s", lang.code)
+        return cached
+
     protected_text, replacements = _protect_glossary(text)
 
     translated = await translate_deepl(session, protected_text, lang.code)
 
     if translated is None:
         log.info("DeepL unavailable, trying Google Translate for %s", lang.code)
-        # Strip HTML for Google (it doesn't handle tags well)
         plain = re.sub(r"<[^>]+>", "", protected_text)
         translated = await translate_google(session, plain, lang.code)
 
     if translated is None:
         log.error("All translation backends failed for %s", lang.code)
-        return text  # return original as last resort
+        return text
 
-    # Restore glossary terms
     translated = _restore_glossary(translated, replacements)
-
-    # Apply name transliteration fixes
     translated = apply_name_fixes(translated, lang)
+    result = clean_html(translated)
 
-    return clean_html(translated)
+    # T15: Save to cache
+    _cache_set(text, lang.code, result)
+
+    return result
