@@ -5,15 +5,13 @@ main.py — T21: one-time republish marker, bot commands, polling loop.
 
 import asyncio
 import logging
-import os
 import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 import aiohttp
 
-from bot.config import SOURCE_CHANNELS, LANGUAGES, POLL_INTERVAL, BOT_TOKEN, ADMIN_CHAT_ID, DATA_DIR
+from bot.config import SOURCE_CHANNELS, LANGUAGES, POLL_INTERVAL, BOT_TOKEN, ADMIN_CHAT_ID
 from bot.scraper import fetch_channel_posts, Post
 from bot.translator import translate
 from bot.publisher import publish_post, send_admin_alert, tg_request
@@ -38,24 +36,6 @@ _ZERO_FETCH_ALERT = 6
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 _last_update_id = 0
-
-# T21: One-time republish marker
-_REPUBLISH_MARKER = DATA_DIR / "republish_v6_done"
-
-
-def _do_one_time_republish():
-    """T21: Clear all state files to force republish. Runs once."""
-    if _REPUBLISH_MARKER.exists():
-        return  # already done
-
-    log.info("T21: One-time republish — clearing all state files")
-    for f in DATA_DIR.iterdir():
-        if f.name.endswith(".json"):
-            f.unlink()
-            log.info("  Deleted %s", f.name)
-
-    # DON'T create marker yet — we'll create it after first successful cycle
-    # so that if the bot crashes before publishing, it retries
 
 
 # ─── Bot commands ────────────────────────────────────────────────────────────
@@ -236,17 +216,33 @@ async def process_cycle():
             if cycle_published:
                 log.info("Published %d to %s", cycle_published, lang.chat_id)
 
-    # T21: Mark republish done after first successful cycle
-    if not _REPUBLISH_MARKER.exists():
-        _REPUBLISH_MARKER.touch()
-        log.info("T21: Republish marker created — won't clear state again")
-
     health.last_cycle_ts = time.time()
     health.last_cycle_published = cycle_published
     health.last_cycle_errors = cycle_errors
     health.total_published += cycle_published
     health.today_published += cycle_published
     health.today_errors += cycle_errors
+
+
+async def seed_initial_state():
+    """First run: mark all existing posts as seen (don't flood channels)."""
+    log.info("First run — marking existing posts as seen")
+    async with aiohttp.ClientSession() as session:
+        for ch_name in SOURCE_CHANNELS:
+            posts = await fetch_channel_posts(session, ch_name)
+            for lang in LANGUAGES:
+                seen = load_seen(lang.code)
+                published = load_published(lang.code)
+                hashes = load_content_hashes(lang.code)
+                for p in posts:
+                    seen.add(p.post_id)
+                    published.add(p.post_id)
+                    hashes.add(content_hash(p.text_plain))
+                save_seen(lang.code, seen)
+                save_published(lang.code, published)
+                save_content_hashes(lang.code, hashes)
+            await asyncio.sleep(1)
+    log.info("Initial state saved.")
 
 
 async def main():
@@ -256,13 +252,8 @@ async def main():
 
     await health.start_health_server()
 
-    # T21: One-time republish
-    _do_one_time_republish()
-
-    # If completely fresh (no state at all), seed
     if not has_any_state():
-        # Don't seed — let it publish everything it finds (T21 behavior)
-        log.info("No state files — will publish all visible posts")
+        await seed_initial_state()
 
     while True:
         try:

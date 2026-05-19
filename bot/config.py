@@ -3,7 +3,7 @@ config.py — Settings, channels, languages, glossary.
 """
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 # ─── Env vars ────────────────────────────────────────────────────────────────
@@ -36,22 +36,110 @@ SOURCE_CHANNELS = [
 ]
 
 # ─── Glossary: never translate these terms ───────────────────────────────────
-# These get wrapped in <keep> tags before translation and unwrapped after.
+# Only terms that should pass through unchanged in ALL languages.
+# Organizations and names that need per-language translation go in name_fixes.
 
 GLOSSARY = [
-    # People
-    "Навальный", "Навальная", "Навального", "Навальной", "Навальному",
+    # Hashtags handled separately in translator.py
+    # People names that should stay as-is (nominative Latin forms)
     "Navalny", "Navalnaya", "Nawalny", "Nawalnaja",
-    "Волков", "Волкова", "Волкову",
-    "Певчих",
-    "Жданов", "Жданова",
-    "Шаведдинов", "Шаведдинова",
-    # Organizations
-    "ФБК", "FBK", "АСФ", "ACF",
-    "Единая Россия", "ЕдРо",
-    "Команда Навального", "Team Navalny",
-    # Hashtags (pattern handled separately in translator.py)
+    "FBK", "ACF",
+    "Team Navalny",
 ]
+
+# ─── Post-translation replacements per language ──────────────────────────────
+# Applied AFTER DeepL translates. Covers:
+# - Name transliteration (Navalny↔Nawalny)
+# - Russian leftovers DeepL didn't translate
+# - Organization names that need specific translations
+
+NAME_FIXES = {
+    "DE": {
+        # Navalny family — all case forms
+        "Navalny": "Nawalny", "navalny": "nawalny",
+        "Navalnaya": "Nawalnaja", "navalnaya": "nawalnaja",
+        "Navalniy": "Nawalny",
+        "Навальный": "Nawalny", "Навальная": "Nawalnaja",
+        "Навального": "Nawalnys", "Навальной": "Nawalnaja",
+        "Навальному": "Nawalny",
+        # Volkov
+        "Волков": "Wolkow", "Волкова": "Wolkow", "Волкову": "Wolkow",
+        # Pevchikh
+        "Певчих": "Pewtschich",
+        # Zhdanov
+        "Жданов": "Schdanow", "Жданова": "Schdanow",
+        # Shaveddinov
+        "Шаведдинов": "Schaweddinow", "Шаведдинова": "Schaweddinow",
+        # Yulia
+        "Юлия Навальная": "Julia Nawalnaja", "Юлии Навальной": "Julia Nawalnaja",
+        # Organizations
+        "Единая Россия": "Einiges Russland", "Единой России": "Einiges Russland",
+        '"Единая Россия"': '\u201EEiniges Russland\u201C',
+        "«Единая Россия»": "\u201EEiniges Russland\u201C",
+        "ЕдРо": "Einiges Russland",
+        "ФБК": "Stiftung für Korruptionsbekämpfung",
+        "Фонд борьбы с коррупцией": "Stiftung für Korruptionsbekämpfung",
+        "Фонд Борьбы с Коррупцией": "Stiftung für Korruptionsbekämpfung",
+        "Команда Навального": "Team Nawalny", "Команды Навального": "Team Nawalny",
+        "АСФ": "ASF",
+    },
+    "EN-GB": {
+        # Navalny family
+        "Nawalny": "Navalny", "nawalny": "navalny",
+        "Nawalnaja": "Navalnaya", "nawalnaja": "navalnaya",
+        "Навальный": "Navalny", "Навальная": "Navalnaya",
+        "Навального": "Navalny's", "Навальной": "Navalnaya",
+        "Навальному": "Navalny",
+        # Volkov
+        "Волков": "Volkov", "Волкова": "Volkov", "Волкову": "Volkov",
+        # Pevchikh
+        "Певчих": "Pevchikh",
+        # Zhdanov
+        "Жданов": "Zhdanov", "Жданова": "Zhdanov",
+        # Shaveddinov
+        "Шаведдинов": "Shaveddinov", "Шаведдинова": "Shaveddinov",
+        # Yulia
+        "Юлия Навальная": "Yulia Navalnaya", "Юлии Навальной": "Yulia Navalnaya",
+        # Organizations
+        "Единая Россия": "United Russia", "Единой России": "United Russia",
+        '"Единая Россия"': '"United Russia"',
+        "«Единая Россия»": '"United Russia"',
+        "ЕдРо": "United Russia",
+        "ФБК": "Anti-Corruption Foundation",
+        "Фонд борьбы с коррупцией": "Anti-Corruption Foundation",
+        "Фонд Борьбы с Коррупцией": "Anti-Corruption Foundation",
+        "Команда Навального": "Team Navalny", "Команды Навального": "Team Navalny",
+        "АСФ": "ACF",
+    },
+    "FR": {
+        # Navalny family
+        "Nawalny": "Navalny", "nawalny": "navalny",
+        "Nawalnaja": "Navalnaya", "nawalnaja": "navalnaya",
+        "Навальный": "Navalny", "Навальная": "Navalnaya",
+        "Навального": "Navalny", "Навальной": "Navalnaya",
+        "Навальному": "Navalny",
+        # Volkov
+        "Волков": "Volkov", "Волкова": "Volkov", "Волкову": "Volkov",
+        # Pevchikh
+        "Певчих": "Pevchikh",
+        # Zhdanov
+        "Жданов": "Jdanov", "Жданова": "Jdanov",
+        # Shaveddinov
+        "Шаведдинов": "Chaveddinov", "Шаведдинова": "Chaveddinov",
+        # Yulia
+        "Юлия Навальная": "Ioulia Navalnaya", "Юлии Навальной": "Ioulia Navalnaya",
+        # Organizations
+        "Единая Россия": "Russie unie", "Единой России": "Russie unie",
+        '"Единая Россия"': "\u00ab\u00a0Russie unie\u00a0\u00bb",
+        "«Единая Россия»": "\u00ab\u00a0Russie unie\u00a0\u00bb",
+        "ЕдРо": "Russie unie",
+        "ФБК": "Fondation anti-corruption",
+        "Фонд борьбы с коррупцией": "Fondation anti-corruption",
+        "Фонд Борьбы с Коррупцией": "Fondation anti-corruption",
+        "Команда Навального": "Équipe Navalny", "Команды Навального": "Équipe Navalny",
+        "АСФ": "FCA",
+    },
+}
 
 # ─── Channel display names per language ──────────────────────────────────────
 
@@ -94,7 +182,10 @@ class LangConfig:
     source_label: str
     part2_label: str
     channel_name: str
-    name_fixes: dict = field(default_factory=dict)
+
+    @property
+    def name_fixes(self) -> dict:
+        return NAME_FIXES.get(self.code, {})
 
 LANGUAGES = [
     LangConfig(
@@ -103,12 +194,6 @@ LANGUAGES = [
         source_label="Quelle",
         part2_label="Teil 2",
         channel_name="Nawalny Deutsch",
-        name_fixes={
-            "Navalny": "Nawalny", "navalny": "nawalny",
-            "Navalnaya": "Nawalnaja", "navalnaya": "nawalnaja",
-            "Navalniy": "Nawalny",
-            "Навальный": "Nawalny", "Навальная": "Nawalnaja",
-        },
     ),
     LangConfig(
         code="EN-GB",
@@ -116,11 +201,6 @@ LANGUAGES = [
         source_label="Source",
         part2_label="Part 2",
         channel_name="Navalny English",
-        name_fixes={
-            "Nawalny": "Navalny", "nawalny": "navalny",
-            "Nawalnaja": "Navalnaya", "nawalnaja": "navalnaya",
-            "Навальный": "Navalny", "Навальная": "Navalnaya",
-        },
     ),
     LangConfig(
         code="FR",
@@ -128,10 +208,5 @@ LANGUAGES = [
         source_label="Source\u00a0",
         part2_label="Partie 2",
         channel_name="Navalny Français",
-        name_fixes={
-            "Nawalny": "Navalny", "nawalny": "navalny",
-            "Nawalnaja": "Navalnaya", "nawalnaja": "navalnaya",
-            "Навальный": "Navalny", "Навальная": "Navalnaya",
-        },
     ),
 ]
