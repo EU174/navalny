@@ -1,11 +1,11 @@
 """
 scraper.py — Fetch posts from public Telegram channel previews.
-Detects media, extracts message_id, cleans embed artifacts.
+Extracts photo URLs, detects video/youtube, removes embed artifacts.
 """
 
 import re
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html import escape as html_escape
 from typing import Optional
 
@@ -24,8 +24,9 @@ class Post:
     message_id: int
     text_html: str
     text_plain: str
-    has_media: bool = False
-    youtube_id: Optional[str] = None  # for T11/T12
+    photo_urls: list[str] = field(default_factory=list)  # all photo URLs
+    has_video: bool = False
+    youtube_id: Optional[str] = None
 
 
 # ─── HTML conversion ─────────────────────────────────────────────────────────
@@ -54,19 +55,24 @@ def tg_html(el) -> str:
     if tag == "a":
         href = el.get("href", "")
         return f'<a href="{html_escape(href)}">{inner}</a>' if href else inner
-    if tag in ("p", "div"):
-        return f"{inner}\n\n"
-    if tag == "blockquote":
+    if tag in ("p", "div", "blockquote"):
         return f"{inner}\n\n"
     return inner
 
 
 def _extract_youtube_id(text: str) -> Optional[str]:
-    """Extract YouTube video ID from text."""
     m = re.search(
         r"(?:youtu\.be/|youtube\.com/watch\?v=|youtube\.com/embed/)([a-zA-Z0-9_-]{11})",
         text
     )
+    return m.group(1) if m else None
+
+
+def _extract_photo_url(el) -> Optional[str]:
+    if not el:
+        return None
+    style = el.get("style", "")
+    m = re.search(r"url\(['\"]?(https://[^'\")\s]+)['\"]?\)", style)
     return m.group(1) if m else None
 
 
@@ -102,17 +108,15 @@ def clean_html(text: str) -> str:
         for _ in range(a_closes - a_opens):
             text = re.sub(r"</a>", "", text, count=1)
 
-    # T10: Remove embed/link-preview artifacts
+    # Remove embed artifacts
     lines = text.split("\n")
     cleaned = []
     for line in lines:
         s = line.strip()
-        # Skip standalone emoji-only lines (embed icons)
         if s and len(s) <= 3 and not s.isalnum():
             plain = re.sub(r"<[^>]+>", "", s)
-            if all(ord(c) > 0x2000 or c in "❗️❤️🔥💪🎬📹📺🔴▶️⚡️" for c in plain.replace(" ", "")):
+            if all(ord(c) > 0x2000 or c in "❗️❤️🔥💪🎬📹📺🔴▶️⚡️🔘" for c in plain.replace(" ", "")):
                 continue
-        # Skip "ChannelName | ButtonText" lines (embed buttons)
         plain_line = re.sub(r"<[^>]+>", "", s)
         if re.match(r"^.{1,40}\s*\|\s*.{1,30}$", plain_line):
             continue
@@ -158,7 +162,7 @@ async def fetch_channel_posts(
         if msg.select_one("a.tgme_widget_message_forwarded_from_name"):
             continue
 
-        # T10: Remove link preview blocks BEFORE extracting text
+        # Remove link preview blocks before text extraction
         for preview in msg.select("a.tgme_widget_message_link_preview"):
             preview.decompose()
 
@@ -172,14 +176,20 @@ async def fetch_channel_posts(
         if len(text_plain) < MIN_POST_LENGTH:
             continue
 
-        has_photo = bool(msg.select_one("a.tgme_widget_message_photo_wrap"))
+        # Extract ALL photo URLs
+        photo_urls = []
+        for pw in msg.select("a.tgme_widget_message_photo_wrap"):
+            u = _extract_photo_url(pw)
+            if u:
+                photo_urls.append(u)
+
+        # Detect video
         has_video = bool(
             msg.select_one("video.tgme_widget_message_video")
             or msg.select_one("a.tgme_widget_message_video_wrap")
             or msg.select_one("i.tgme_widget_message_video_thumb")
         )
 
-        # T11: Extract YouTube ID
         youtube_id = _extract_youtube_id(text_plain)
 
         posts.append(Post(
@@ -188,7 +198,8 @@ async def fetch_channel_posts(
             message_id=message_id,
             text_html=text_html,
             text_plain=text_plain,
-            has_media=has_photo or has_video,
+            photo_urls=photo_urls,
+            has_video=has_video,
             youtube_id=youtube_id,
         ))
 
