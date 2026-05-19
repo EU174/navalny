@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-main.py — Polling loop + T16: bot commands (/status, /force).
+main.py — T21: one-time republish marker, bot commands, polling loop.
 """
 
 import asyncio
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import aiohttp
 
-from bot.config import SOURCE_CHANNELS, LANGUAGES, POLL_INTERVAL, BOT_TOKEN, ADMIN_CHAT_ID
+from bot.config import SOURCE_CHANNELS, LANGUAGES, POLL_INTERVAL, BOT_TOKEN, ADMIN_CHAT_ID, DATA_DIR
 from bot.scraper import fetch_channel_posts, Post
 from bot.translator import translate
 from bot.publisher import publish_post, send_admin_alert, tg_request
@@ -37,15 +39,31 @@ _ZERO_FETCH_ALERT = 6
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 _last_update_id = 0
 
+# T21: One-time republish marker
+_REPUBLISH_MARKER = DATA_DIR / "republish_v6_done"
 
-# ─── T16: Bot commands ───────────────────────────────────────────────────────
 
-async def handle_commands(session: aiohttp.ClientSession):
-    """Poll for bot commands from admin."""
+def _do_one_time_republish():
+    """T21: Clear all state files to force republish. Runs once."""
+    if _REPUBLISH_MARKER.exists():
+        return  # already done
+
+    log.info("T21: One-time republish — clearing all state files")
+    for f in DATA_DIR.iterdir():
+        if f.name.endswith(".json"):
+            f.unlink()
+            log.info("  Deleted %s", f.name)
+
+    # DON'T create marker yet — we'll create it after first successful cycle
+    # so that if the bot crashes before publishing, it retries
+
+
+# ─── Bot commands ────────────────────────────────────────────────────────────
+
+async def handle_commands(session):
     global _last_update_id
     if not ADMIN_CHAT_ID:
         return
-
     try:
         url = f"{TG_API}/getUpdates"
         params = {"offset": _last_update_id + 1, "timeout": 0, "limit": 10}
@@ -59,22 +77,15 @@ async def handle_commands(session: aiohttp.ClientSession):
                 msg = update.get("message", {})
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 text = msg.get("text", "").strip()
-
-                # Only respond to admin
                 if chat_id != str(ADMIN_CHAT_ID):
                     continue
-
                 if text == "/status":
                     await cmd_status(session, chat_id)
                 elif text.startswith("/force "):
-                    post_id = text[7:].strip()
-                    await cmd_force(session, chat_id, post_id)
+                    await cmd_force(session, chat_id, text[7:].strip())
                 elif text == "/help":
-                    await tg_request(
-                        session, "sendMessage",
-                        chat_id=chat_id,
-                        text="Commands:\n/status — bot stats\n/force channel/id — republish post\n/help — this",
-                    )
+                    await tg_request(session, "sendMessage", chat_id=chat_id,
+                        text="Commands:\n/status — bot stats\n/force channel/id — republish\n/help")
     except Exception as e:
         log.debug("Command poll error: %s", e)
 
@@ -87,31 +98,24 @@ async def cmd_status(session, chat_id):
         f"Total: {stats['total_published']} published\n"
         f"DeepL chars: {stats['deepl_chars_used']:,}\n\n"
         f"Last cycle: {stats['last_cycle_secs_ago']:.0f}s ago\n"
-        f"Sources: {stats['sources']} channels\n"
-        f"Targets: {stats['targets']} languages"
+        f"Sources: {stats['sources']}, Targets: {stats['targets']}"
     )
     await tg_request(session, "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML")
 
 
-async def cmd_force(session, chat_id, post_id: str):
-    """Force republish a specific post."""
+async def cmd_force(session, chat_id, post_id):
     if "/" not in post_id:
         await tg_request(session, "sendMessage", chat_id=chat_id,
                          text="Usage: /force channel/id\nExample: /force teamnavalny/28126")
         return
-
     channel = post_id.split("/")[0]
-    await tg_request(session, "sendMessage", chat_id=chat_id,
-                     text=f"⏳ Fetching {post_id}...")
-
+    await tg_request(session, "sendMessage", chat_id=chat_id, text=f"⏳ Fetching {post_id}...")
     posts = await fetch_channel_posts(session, channel)
     post = next((p for p in posts if p.post_id == post_id), None)
-
     if not post:
         await tg_request(session, "sendMessage", chat_id=chat_id,
-                         text=f"❌ Post {post_id} not found in recent posts of @{channel}")
+                         text=f"❌ Not found in recent posts of @{channel}")
         return
-
     results = []
     for lang in LANGUAGES:
         try:
@@ -124,19 +128,17 @@ async def cmd_force(session, chat_id, post_id: str):
                 save_published(lang.code, published)
         except Exception as e:
             results.append(f"{lang.code}: ❌ {e}")
-
     await tg_request(session, "sendMessage", chat_id=chat_id,
-                     text=f"Force publish {post_id}:\n" + "\n".join(results))
+                     text=f"Force {post_id}:\n" + "\n".join(results))
 
 
 # ─── Main loop ───────────────────────────────────────────────────────────────
 
-async def process_post(session, post: Post, lang, seen, published, hashes):
+async def process_post(session, post, lang, seen, published, hashes):
     ch = content_hash(post.text_plain)
     if ch in hashes:
-        log.info("Skipping %s (duplicate content) for %s", post.post_id, lang.code)
+        log.info("Skipping %s (dupe) for %s", post.post_id, lang.code)
         return False, True
-
     log.info("Translating %s → %s", post.post_id, lang.code)
     try:
         translated = await translate(session, post.text_html, lang)
@@ -152,7 +154,6 @@ async def process_post(session, post: Post, lang, seen, published, hashes):
 async def process_cycle():
     global _zero_fetch_count
 
-    # Reset daily stats at midnight
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if health.today_date != today:
         health.today_date = today
@@ -163,10 +164,8 @@ async def process_cycle():
     cycle_errors = 0
 
     async with aiohttp.ClientSession() as session:
-        # T16: Check for admin commands
         await handle_commands(session)
 
-        # 1. Fetch
         all_posts: list[Post] = []
         for ch in SOURCE_CHANNELS:
             posts = await fetch_channel_posts(session, ch)
@@ -177,11 +176,8 @@ async def process_cycle():
             _zero_fetch_count += 1
             log.warning("No posts fetched (%d consecutive)", _zero_fetch_count)
             if _zero_fetch_count >= _ZERO_FETCH_ALERT:
-                await send_admin_alert(
-                    session,
-                    f"⚠️ {_zero_fetch_count} cycles with 0 posts.\n"
-                    "t.me/s/ may be blocked."
-                )
+                await send_admin_alert(session,
+                    f"⚠️ {_zero_fetch_count} cycles with 0 posts.")
                 _zero_fetch_count = 0
             health.last_cycle_ts = time.time()
             health.last_cycle_published = 0
@@ -192,7 +188,6 @@ async def process_cycle():
         post_map = {p.post_id: p for p in all_posts}
         all_posts.sort(key=lambda p: p.post_id)
 
-        # 2. Process
         for lang in LANGUAGES:
             seen = load_seen(lang.code)
             published = load_published(lang.code)
@@ -201,11 +196,8 @@ async def process_cycle():
             for post in all_posts:
                 if post.post_id in seen:
                     continue
-
                 ok, is_dupe = await process_post(
-                    session, post, lang, seen, published, hashes
-                )
-
+                    session, post, lang, seen, published, hashes)
                 seen.add(post.post_id)
                 if ok:
                     published.add(post.post_id)
@@ -214,13 +206,11 @@ async def process_cycle():
                 elif not is_dupe:
                     mark_failed(lang.code, post.post_id)
                     cycle_errors += 1
-
                 save_seen(lang.code, seen)
                 save_published(lang.code, published)
                 save_content_hashes(lang.code, hashes)
                 await asyncio.sleep(1)
 
-            # Retry failed
             retryable = get_retryable(lang.code)
             for post_id in retryable:
                 if post_id in published:
@@ -229,11 +219,9 @@ async def process_cycle():
                 post = post_map.get(post_id)
                 if not post:
                     continue
-
                 log.info("Retrying %s → %s", post_id, lang.code)
                 ok, _ = await process_post(
-                    session, post, lang, seen, published, hashes
-                )
+                    session, post, lang, seen, published, hashes)
                 if ok:
                     published.add(post_id)
                     save_published(lang.code, published)
@@ -246,7 +234,12 @@ async def process_cycle():
                 await asyncio.sleep(1)
 
             if cycle_published:
-                log.info("Published %d posts to %s", cycle_published, lang.chat_id)
+                log.info("Published %d to %s", cycle_published, lang.chat_id)
+
+    # T21: Mark republish done after first successful cycle
+    if not _REPUBLISH_MARKER.exists():
+        _REPUBLISH_MARKER.touch()
+        log.info("T21: Republish marker created — won't clear state again")
 
     health.last_cycle_ts = time.time()
     health.last_cycle_published = cycle_published
@@ -256,26 +249,6 @@ async def process_cycle():
     health.today_errors += cycle_errors
 
 
-async def seed_initial_state():
-    log.info("First run — marking existing posts as seen")
-    async with aiohttp.ClientSession() as session:
-        for ch_name in SOURCE_CHANNELS:
-            posts = await fetch_channel_posts(session, ch_name)
-            for lang in LANGUAGES:
-                seen = load_seen(lang.code)
-                published = load_published(lang.code)
-                hashes = load_content_hashes(lang.code)
-                for p in posts:
-                    seen.add(p.post_id)
-                    published.add(p.post_id)
-                    hashes.add(content_hash(p.text_plain))
-                save_seen(lang.code, seen)
-                save_published(lang.code, published)
-                save_content_hashes(lang.code, hashes)
-            await asyncio.sleep(1)
-    log.info("Initial state saved.")
-
-
 async def main():
     log.info("Bot starting. Polling every %ds", POLL_INTERVAL)
     log.info("Sources: %s", ", ".join(f"@{c}" for c in SOURCE_CHANNELS))
@@ -283,15 +256,19 @@ async def main():
 
     await health.start_health_server()
 
+    # T21: One-time republish
+    _do_one_time_republish()
+
+    # If completely fresh (no state at all), seed
     if not has_any_state():
-        await seed_initial_state()
+        # Don't seed — let it publish everything it finds (T21 behavior)
+        log.info("No state files — will publish all visible posts")
 
     while True:
         try:
             await process_cycle()
         except Exception as e:
             log.error("Cycle error: %s", e, exc_info=True)
-
         log.info("Sleeping %ds until next cycle", POLL_INTERVAL)
         await asyncio.sleep(POLL_INTERVAL)
 

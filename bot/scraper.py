@@ -1,6 +1,5 @@
 """
-scraper.py — Fetch posts from public Telegram channel previews.
-Extracts photo URLs, detects video/youtube, removes embed artifacts.
+scraper.py — T18: aggressive embed artifact removal.
 """
 
 import re
@@ -24,12 +23,10 @@ class Post:
     message_id: int
     text_html: str
     text_plain: str
-    photo_urls: list[str] = field(default_factory=list)  # all photo URLs
+    photo_urls: list[str] = field(default_factory=list)
     has_video: bool = False
     youtube_id: Optional[str] = None
 
-
-# ─── HTML conversion ─────────────────────────────────────────────────────────
 
 def tg_html(el) -> str:
     if isinstance(el, NavigableString):
@@ -76,8 +73,68 @@ def _extract_photo_url(el) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _is_junk_line(line: str) -> bool:
+    """Check if a line is an embed artifact (emoji-only, channel name, button, etc.)."""
+    s = line.strip()
+    if not s:
+        return False
+
+    # Strip HTML tags for analysis
+    plain = re.sub(r"<[^>]+>", "", s).strip()
+    if not plain:
+        return True  # empty after stripping tags
+
+    # Single emoji or 1-3 char emoji-like
+    if len(plain) <= 4:
+        # Check if all chars are emoji/symbols (non-letter, non-digit)
+        if not any(c.isalnum() for c in plain):
+            return True
+
+    # "ChannelName | ButtonText" pattern
+    if re.match(r"^.{1,50}\s*\|\s*.{1,30}$", plain):
+        return True
+
+    # Known channel footer patterns (Russian)
+    footer_patterns = [
+        r"^Команда Навального$",
+        r"^Навальный LIVE$",
+        r"^Навальный$",
+        r"^\|?\s*Поддержать\s*$",
+        r"^\|?\s*Support\s*(us)?\s*$",
+        r"^\|?\s*Подписаться\s*$",
+        r"^\|?\s*Subscribe\s*$",
+        r"^\|?\s*Soutenir\s*$",
+        r"^\|?\s*Unterstützen\s*$",
+    ]
+    for pat in footer_patterns:
+        if re.match(pat, plain, re.IGNORECASE):
+            return True
+
+    return False
+
+
+def _clean_trailing_junk(text: str) -> str:
+    """T18: Remove trailing embed artifacts aggressively.
+    Walk backwards from end, remove junk lines until we hit real content."""
+    lines = text.split("\n")
+
+    # Find last line with real content (>10 chars of actual text, not just emoji/links)
+    last_real = -1
+    for i in range(len(lines) - 1, -1, -1):
+        plain = re.sub(r"<[^>]+>", "", lines[i]).strip()
+        if len(plain) > 10 and any(c.isalpha() for c in plain):
+            # Check it's not a known footer
+            if not _is_junk_line(lines[i]):
+                last_real = i
+                break
+
+    if last_real >= 0:
+        lines = lines[:last_real + 1]
+
+    return "\n".join(lines)
+
+
 def clean_html(text: str) -> str:
-    """Strip unsupported tags, fix broken HTML, remove embed artifacts."""
     allowed = {"b", "strong", "i", "em", "u", "s", "strike", "del",
                "code", "pre", "a"}
 
@@ -108,26 +165,17 @@ def clean_html(text: str) -> str:
         for _ in range(a_closes - a_opens):
             text = re.sub(r"</a>", "", text, count=1)
 
-    # Remove embed artifacts
+    # T18: Remove junk lines (emoji-only, channel names, buttons)
     lines = text.split("\n")
-    cleaned = []
-    for line in lines:
-        s = line.strip()
-        if s and len(s) <= 3 and not s.isalnum():
-            plain = re.sub(r"<[^>]+>", "", s)
-            if all(ord(c) > 0x2000 or c in "❗️❤️🔥💪🎬📹📺🔴▶️⚡️🔘" for c in plain.replace(" ", "")):
-                continue
-        plain_line = re.sub(r"<[^>]+>", "", s)
-        if re.match(r"^.{1,40}\s*\|\s*.{1,30}$", plain_line):
-            continue
-        cleaned.append(line)
+    cleaned = [line for line in lines if not _is_junk_line(line)]
     text = "\n".join(cleaned)
+
+    # T18: Remove trailing junk
+    text = _clean_trailing_junk(text)
 
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-
-# ─── Channel scraper ─────────────────────────────────────────────────────────
 
 async def fetch_channel_posts(
     session: aiohttp.ClientSession, channel: str
@@ -162,7 +210,7 @@ async def fetch_channel_posts(
         if msg.select_one("a.tgme_widget_message_forwarded_from_name"):
             continue
 
-        # Remove link preview blocks before text extraction
+        # Remove link preview blocks BEFORE text extraction
         for preview in msg.select("a.tgme_widget_message_link_preview"):
             preview.decompose()
 
@@ -176,14 +224,12 @@ async def fetch_channel_posts(
         if len(text_plain) < MIN_POST_LENGTH:
             continue
 
-        # Extract ALL photo URLs
         photo_urls = []
         for pw in msg.select("a.tgme_widget_message_photo_wrap"):
             u = _extract_photo_url(pw)
             if u:
                 photo_urls.append(u)
 
-        # Detect video
         has_video = bool(
             msg.select_one("video.tgme_widget_message_video")
             or msg.select_one("a.tgme_widget_message_video_wrap")
