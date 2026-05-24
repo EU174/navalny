@@ -1,0 +1,18 @@
+name: Deploy to Oracle VM
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 152.70.164.2
+          username: opc
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          script: |
+            cd ~/navalny-bot
+            git pull origin main
+            sudo systemctl restart navalny-bot
