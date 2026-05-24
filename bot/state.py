@@ -5,7 +5,9 @@ state.py — Deduplication, retry tracking, content hashing.
 import hashlib
 import json
 import logging
+import os
 import re
+import tempfile
 from pathlib import Path
 
 from bot.config import DATA_DIR, MAX_RETRIES
@@ -17,6 +19,22 @@ MAX_IDS = 5000
 
 def _path(prefix: str, lang_code: str) -> Path:
     return DATA_DIR / f"{prefix}_{lang_code.lower()}.json"
+
+
+def _atomic_write(path: Path, content: str):
+    """T23: Write to temp file then rename — atomic on POSIX."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        os.write(fd, content.encode())
+        os.close(fd)
+        os.rename(tmp, str(path))
+    except Exception:
+        os.close(fd) if not os.get_inheritable(fd) else None
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _load_set(prefix: str, lang_code: str) -> set[str]:
@@ -31,7 +49,7 @@ def _load_set(prefix: str, lang_code: str) -> set[str]:
 
 def _save_set(prefix: str, lang_code: str, data: set[str]):
     p = _path(prefix, lang_code)
-    p.write_text(json.dumps(sorted(data)[-MAX_IDS:]))
+    _atomic_write(p, json.dumps(sorted(data)[-MAX_IDS:]))
 
 
 def _load_dict(prefix: str, lang_code: str) -> dict:
@@ -49,7 +67,7 @@ def _save_dict(prefix: str, lang_code: str, data: dict):
     if len(data) > MAX_IDS:
         keys = sorted(data.keys())[-MAX_IDS:]
         data = {k: data[k] for k in keys}
-    p.write_text(json.dumps(data))
+    _atomic_write(p, json.dumps(data))
 
 
 def load_seen(lang_code: str) -> set[str]:

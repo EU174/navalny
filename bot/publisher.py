@@ -27,18 +27,28 @@ _YT_LANG_MAP = {"DE": "de", "EN-GB": "en", "FR": "fr"}
 
 
 async def tg_request(session, method, **kwargs) -> Optional[dict]:
+    """T28: TG API with retry-after handling."""
     url = f"{TG_API}/{method}"
-    try:
-        async with session.post(url, json=kwargs,
-                                timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            data = await resp.json()
-            if not data.get("ok"):
+    for attempt in range(3):
+        try:
+            async with session.post(url, json=kwargs,
+                                    timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                data = await resp.json()
+                if data.get("ok"):
+                    return data.get("result")
+                # T28: Handle rate limiting
+                if resp.status == 429:
+                    retry_after = data.get("parameters", {}).get("retry_after", 5)
+                    log.warning("TG rate limited, waiting %ds", retry_after)
+                    await asyncio.sleep(retry_after)
+                    continue
                 log.error("TG API %s failed: %s", method, data.get("description"))
                 return None
-            return data.get("result")
-    except Exception as e:
-        log.error("TG API %s error: %s", method, e)
-        return None
+        except Exception as e:
+            log.error("TG API %s error (attempt %d): %s", method, attempt + 1, e)
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+    return None
 
 
 async def tg_upload(session, method, file_field, file_data, filename, **params):
@@ -133,23 +143,67 @@ def _apply_yt_subtitles(text, youtube_id, lang):
 
 
 def _split_message(text, limit):
+    """T25: HTML-aware message splitter — closes/reopens tags at boundaries."""
     if len(text) <= limit:
         return [text]
+
+    # Track open tags
+    _SIMPLE_TAGS = {"b", "i", "u", "s", "code", "pre"}
+
+    def _get_open_tags(html_text):
+        """Return list of currently open simple tags."""
+        tags = []
+        for m in re.finditer(r"<(/?)(\w+)[^>]*>", html_text):
+            is_close, tag = m.group(1), m.group(2).lower()
+            if tag not in _SIMPLE_TAGS:
+                continue
+            if is_close:
+                if tags and tags[-1] == tag:
+                    tags.pop()
+            else:
+                tags.append(tag)
+        return tags
+
     chunks = []
     while text:
         if len(text) <= limit:
             chunks.append(text)
             break
+
+        # Find split point
+        cut_at = limit
         for sep in ["\n\n", "\n", " "]:
-            cut = text[:limit].rsplit(sep, 1)
-            if len(cut) == 2 and len(cut[0]) > limit // 3:
-                chunks.append(cut[0])
-                text = cut[1]
+            pos = text[:limit].rfind(sep)
+            if pos > limit // 3:
+                cut_at = pos
                 break
-        else:
-            chunks.append(text[:limit])
-            text = text[limit:]
+
+        chunk = text[:cut_at]
+        text = text[cut_at:].lstrip("\n ")
+
+        # Close open tags at end of chunk
+        open_tags = _get_open_tags(chunk)
+        closing = "".join(f"</{t}>" for t in reversed(open_tags))
+        reopening = "".join(f"<{t}>" for t in open_tags)
+
+        chunks.append(chunk + closing)
+        if text:
+            text = reopening + text
+
     return chunks
+
+
+async def _send_reply_chunks(session, chat_id, text, msg_id):
+    """T24: Send reply chunks and verify delivery of all parts."""
+    chunks = _split_message(text, MESSAGE_LIMIT)
+    all_ok = True
+    for chunk in chunks:
+        result = await _send_text(session, chat_id, chunk, reply_to=msg_id)
+        if result is None:
+            all_ok = False
+            log.warning("Reply chunk delivery failed for msg %s", msg_id)
+        await asyncio.sleep(0.3)
+    return all_ok
 
 
 # T19: ALL text sends have disable_web_page_preview=True
@@ -250,39 +304,32 @@ async def publish_post(session, post, translated_html, lang) -> bool:
             if result:
                 success = True
         else:
-            # Album + short caption, then reply with full text
             short = header + footer
             result = await _send_album(session, lang.chat_id, photos_data, short)
             if result:
                 msg_id = result.get("message_id")
-                success = True
                 await asyncio.sleep(0.5)
-                for chunk in _split_message(full_text, MESSAGE_LIMIT):
-                    await _send_text(session, lang.chat_id, chunk, reply_to=msg_id)
-                    await asyncio.sleep(0.3)
+                chunks_ok = await _send_reply_chunks(session, lang.chat_id, full_text, msg_id)
+                success = chunks_ok  # T24: success only if all chunks delivered
 
         # Fallback to single photo if album fails
         if not success and photos_data:
-            photos_data = [photos_data[0]]  # fall through to single photo
+            photos_data = [photos_data[0]]
 
     # ── Single photo ─────────────────────────────────────────────────────
     if len(photos_data) == 1 and not success:
         if len(full_text) <= CAPTION_LIMIT:
-            # T20: Everything in one message
             result = await _send_photo(session, lang.chat_id, photos_data[0], full_text)
             if result:
                 success = True
         else:
-            # Photo + short caption, then reply
             short = header + footer
             result = await _send_photo(session, lang.chat_id, photos_data[0], short)
             if result:
                 msg_id = result.get("message_id")
-                success = True
                 await asyncio.sleep(0.5)
-                for chunk in _split_message(full_text, MESSAGE_LIMIT):
-                    await _send_text(session, lang.chat_id, chunk, reply_to=msg_id)
-                    await asyncio.sleep(0.3)
+                chunks_ok = await _send_reply_chunks(session, lang.chat_id, full_text, msg_id)
+                success = chunks_ok  # T24
 
     # ── YouTube thumbnail (no TG photos) ─────────────────────────────────
     if not success and not photos_data and post.youtube_id:
@@ -302,11 +349,9 @@ async def publish_post(session, post, translated_html, lang) -> bool:
                     result = await _send_photo(session, lang.chat_id, img, yt_caption)
                     if result:
                         msg_id = result.get("message_id")
-                        success = True
                         await asyncio.sleep(0.5)
-                        for chunk in _split_message(full_text, MESSAGE_LIMIT):
-                            await _send_text(session, lang.chat_id, chunk, reply_to=msg_id)
-                            await asyncio.sleep(0.3)
+                        chunks_ok = await _send_reply_chunks(session, lang.chat_id, full_text, msg_id)
+                        success = chunks_ok  # T24
                 break
 
     # ── Video (TG native) ────────────────────────────────────────────────

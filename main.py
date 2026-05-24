@@ -33,6 +33,8 @@ log = logging.getLogger("tg-aggregator")
 
 _zero_fetch_count = 0
 _ZERO_FETCH_ALERT = 6
+# T26: Track last seen message_id per channel for gap detection
+_last_seen_ids: dict[str, int] = {}
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 _last_update_id = 0
@@ -122,6 +124,10 @@ async def process_post(session, post, lang, seen, published, hashes):
     log.info("Translating %s → %s", post.post_id, lang.code)
     try:
         translated = await translate(session, post.text_html, lang)
+        # T22: fail-closed — if translation returned None, don't publish
+        if translated is None:
+            log.warning("Translation failed for %s → %s, not publishing", post.post_id, lang.code)
+            return False, False
         ok = await publish_post(session, post, translated, lang)
         if ok:
             hashes.add(ch)
@@ -149,6 +155,19 @@ async def process_cycle():
         all_posts: list[Post] = []
         for ch in SOURCE_CHANNELS:
             posts = await fetch_channel_posts(session, ch)
+            # T26: Gap detection
+            if posts:
+                max_id = max(p.message_id for p in posts)
+                min_id = min(p.message_id for p in posts)
+                prev_max = _last_seen_ids.get(ch)
+                if prev_max is not None and min_id > prev_max + 1:
+                    gap = min_id - prev_max - 1
+                    log.warning("T26: Gap detected in @%s: %d posts may be missed (IDs %d-%d)",
+                                ch, gap, prev_max + 1, min_id - 1)
+                    if gap > 5:
+                        await send_admin_alert(session,
+                            f"⚠️ Gap in @{ch}: ~{gap} posts missed (IDs {prev_max+1}-{min_id-1})")
+                _last_seen_ids[ch] = max_id
             all_posts.extend(posts)
             await asyncio.sleep(1)
 

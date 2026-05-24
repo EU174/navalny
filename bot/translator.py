@@ -153,7 +153,7 @@ async def translate(
 
     if translated is None:
         log.error("All translation backends failed for %s", lang.code)
-        return text
+        return None  # T22: fail-closed — never publish untranslated original
 
     translated = _restore_glossary(translated, replacements)
     translated = apply_name_fixes(translated, lang)
