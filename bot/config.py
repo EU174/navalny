@@ -202,9 +202,6 @@ LANGUAGES = [
         part2_label="Part 2",
         channel_name="Navalny English",
     ),
-    LangConfig(
-        code="FR",
-        chat_id=os.environ.get("TG_CHAT_FR", "@navalnyfrancais"),
         source_label="Source\u00a0",
         part2_label="Partie 2",
         channel_name="Navalny Français",
