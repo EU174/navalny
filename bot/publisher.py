@@ -23,7 +23,7 @@ TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 _consecutive_failures = 0
 _ALERT_THRESHOLD = 5
-_YT_LANG_MAP = {"DE": "de", "EN-GB": "en", "FR": "fr"}
+_YT_LANG_MAP = {"DE": "de", "EN-GB": "en"}
 
 
 async def tg_request(session, method, **kwargs) -> Optional[dict]:
@@ -284,7 +284,20 @@ async def publish_post(session, post, translated_html, lang) -> bool:
 
     header = _build_header(post, lang)
     footer = _build_footer(post, lang)
-    full_text = header + translated_html + footer
+
+    # T32: Append document links (PDF etc.) before the footer
+    doc_block = ""
+    if getattr(post, "documents", None):
+        doc_lines = []
+        for d in post.documents:
+            title = html_escape(d.get("title", "Document"))
+            url = html_escape(d.get("url", ""))
+            if url:
+                doc_lines.append(f'📎 <a href="{url}">{title}</a>')
+        if doc_lines:
+            doc_block = "\n\n" + "\n".join(doc_lines)
+
+    full_text = header + translated_html + doc_block + footer
 
     success = False
 

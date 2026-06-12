@@ -13,7 +13,10 @@ import aiohttp
 
 from bot.config import SOURCE_CHANNELS, LANGUAGES, POLL_INTERVAL, BOT_TOKEN, ADMIN_CHAT_ID
 from bot.scraper import fetch_channel_posts, Post
-from bot.translator import translate
+from bot.translator import (
+    translate, set_alert_callback, get_deepl_usage,
+    cleanup_cache, cache_stats, cache_hits, cache_misses,
+)
 from bot.publisher import publish_post, send_admin_alert, tg_request
 from bot.state import (
     load_seen, save_seen,
@@ -35,6 +38,8 @@ _zero_fetch_count = 0
 _ZERO_FETCH_ALERT = 6
 # T26: Track last seen message_id per channel for gap detection
 _last_seen_ids: dict[str, int] = {}
+# T33: Track published count per channel (session lifetime)
+_channel_published: dict[str, int] = {}
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 _last_update_id = 0
@@ -63,11 +68,13 @@ async def handle_commands(session):
                     continue
                 if text == "/status":
                     await cmd_status(session, chat_id)
+                elif text == "/stats":
+                    await cmd_stats(session, chat_id)
                 elif text.startswith("/force "):
                     await cmd_force(session, chat_id, text[7:].strip())
                 elif text == "/help":
                     await tg_request(session, "sendMessage", chat_id=chat_id,
-                        text="Commands:\n/status — bot stats\n/force channel/id — republish\n/help")
+                        text="Commands:\n/status — bot stats\n/stats — extended stats\n/force channel/id — republish\n/help")
     except Exception as e:
         log.debug("Command poll error: %s", e)
 
@@ -81,6 +88,39 @@ async def cmd_status(session, chat_id):
         f"DeepL chars: {stats['deepl_chars_used']:,}\n\n"
         f"Last cycle: {stats['last_cycle_secs_ago']:.0f}s ago\n"
         f"Sources: {stats['sources']}, Targets: {stats['targets']}"
+    )
+    await tg_request(session, "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML")
+
+
+async def cmd_stats(session, chat_id):
+    """T33: Extended statistics — DeepL usage, cache hit rate, top channels."""
+    import bot.translator as tr
+    stats = health.get_stats()
+    deepl = get_deepl_usage()
+    cstats = cache_stats()
+
+    # Cache hit rate
+    total_lookups = tr.cache_hits + tr.cache_misses
+    hit_rate = round(100 * tr.cache_hits / total_lookups, 1) if total_lookups else 0.0
+
+    # Top channels by published count
+    top = sorted(_channel_published.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    if top:
+        top_lines = "\n".join(f"  • @{ch}: {n}" for ch, n in top)
+    else:
+        top_lines = "  (none yet this session)"
+
+    text = (
+        f"📈 <b>Extended Stats</b>\n\n"
+        f"<b>DeepL ({deepl['month']})</b>\n"
+        f"  {deepl['chars']:,} / {deepl['limit']:,} chars ({deepl['percent']}%)\n\n"
+        f"<b>Translation cache</b>\n"
+        f"  Hit rate: {hit_rate}% ({tr.cache_hits} hits / {tr.cache_misses} misses)\n"
+        f"  Entries: {cstats['entries']} ({cstats['size_kb']} KB)\n\n"
+        f"<b>Top channels (session)</b>\n{top_lines}\n\n"
+        f"<b>Totals</b>\n"
+        f"  Published: {stats['total_published']}\n"
+        f"  Today: {stats['today_published']} pub, {stats['today_errors']} err"
     )
     await tg_request(session, "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML")
 
@@ -102,6 +142,9 @@ async def cmd_force(session, chat_id, post_id):
     for lang in LANGUAGES:
         try:
             translated = await translate(session, post.text_html, lang)
+            if translated is None:
+                results.append(f"{lang.code}: ❌ translation failed")
+                continue
             ok = await publish_post(session, post, translated, lang)
             results.append(f"{lang.code}: {'✅' if ok else '❌'}")
             if ok:
@@ -123,6 +166,12 @@ async def process_post(session, post, lang, seen, published, hashes):
         return False, True
     log.info("Translating %s → %s", post.post_id, lang.code)
     try:
+        # T32: document-only post with little/no text — publish without translation
+        if len(post.text_plain.strip()) < 10 and getattr(post, "documents", None):
+            ok = await publish_post(session, post, "", lang)
+            if ok:
+                hashes.add(ch)
+            return ok, False
         translated = await translate(session, post.text_html, lang)
         # T22: fail-closed — if translation returned None, don't publish
         if translated is None:
@@ -201,6 +250,7 @@ async def process_cycle():
                 if ok:
                     published.add(post.post_id)
                     cycle_published += 1
+                    _channel_published[post.channel] = _channel_published.get(post.channel, 0) + 1  # T33
                     clear_failed(lang.code, post.post_id)
                 elif not is_dupe:
                     mark_failed(lang.code, post.post_id)
@@ -269,16 +319,30 @@ async def main():
     log.info("Sources: %s", ", ".join(f"@{c}" for c in SOURCE_CHANNELS))
     log.info("Targets: %s", ", ".join(l.chat_id for l in LANGUAGES))
 
+    # T31: Wire DeepL 80%-limit alerts to admin
+    async def _deepl_alert(message):
+        async with aiohttp.ClientSession() as s:
+            await send_admin_alert(s, message)
+    set_alert_callback(_deepl_alert)
+
+    # T34: Clean old cache entries on startup
+    cleanup_cache(max_age_days=30)
+
     await health.start_health_server()
 
     if not has_any_state():
         await seed_initial_state()
 
+    cycles = 0
     while True:
         try:
             await process_cycle()
         except Exception as e:
             log.error("Cycle error: %s", e, exc_info=True)
+        # T34: Periodic cache cleanup every ~24h (96 cycles at 15-min interval)
+        cycles += 1
+        if cycles % 96 == 0:
+            cleanup_cache(max_age_days=30)
         log.info("Sleeping %ds until next cycle", POLL_INTERVAL)
         await asyncio.sleep(POLL_INTERVAL)
 

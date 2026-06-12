@@ -22,8 +22,10 @@ today_date: str = ""
 
 def get_stats() -> dict:
     """Return current stats dict (used by /status command and health endpoint)."""
-    from bot.translator import deepl_chars_used
+    from bot.translator import deepl_chars_used, get_deepl_usage, cache_stats, cache_hits, cache_misses
     ago = time.time() - last_cycle_ts if last_cycle_ts else -1
+    total_lookups = cache_hits + cache_misses
+    hit_rate = round(100 * cache_hits / total_lookups, 1) if total_lookups else 0.0
     return {
         "status": "ok",
         "last_cycle_secs_ago": round(ago, 1),
@@ -33,6 +35,9 @@ def get_stats() -> dict:
         "today_published": today_published,
         "today_errors": today_errors,
         "deepl_chars_used": deepl_chars_used,
+        "deepl_usage": get_deepl_usage(),   # T30/T31
+        "cache": cache_stats(),             # T33
+        "cache_hit_rate": hit_rate,         # T33
         "sources": len(SOURCE_CHANNELS),
         "targets": len(LANGUAGES),
     }

@@ -26,6 +26,8 @@ class Post:
     photo_urls: list[str] = field(default_factory=list)
     has_video: bool = False
     youtube_id: Optional[str] = None
+    # T32: documents (PDF etc.) attached to the post
+    documents: list[dict] = field(default_factory=list)  # [{title, url}]
 
 
 def tg_html(el) -> str:
@@ -215,13 +217,21 @@ async def fetch_channel_posts(
             preview.decompose()
 
         text_div = msg.select_one("div.tgme_widget_message_text")
-        if not text_div:
-            continue
+        text_html = tg_html(text_div).strip() if text_div else ""
+        text_plain = text_div.get_text(separator="\n").strip() if text_div else ""
 
-        text_html = tg_html(text_div).strip()
-        text_plain = text_div.get_text(separator="\n").strip()
+        # T32: Detect document attachments (PDF etc.) — done early so
+        # document-only posts with little text still pass the length gate.
+        documents = []
+        for doc in msg.select("a.tgme_widget_message_document_wrap"):
+            href = doc.get("href", "")
+            title_el = doc.select_one("div.tgme_widget_message_document_title")
+            title = title_el.get_text(strip=True) if title_el else "Document"
+            if href:
+                documents.append({"title": title, "url": href})
 
-        if len(text_plain) < MIN_POST_LENGTH:
+        # Skip short posts UNLESS they carry a document attachment
+        if len(text_plain) < MIN_POST_LENGTH and not documents:
             continue
 
         photo_urls = []
@@ -247,6 +257,7 @@ async def fetch_channel_posts(
             photo_urls=photo_urls,
             has_video=has_video,
             youtube_id=youtube_id,
+            documents=documents,  # T32
         ))
 
     log.info("Fetched %d posts from @%s", len(posts), channel)

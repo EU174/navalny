@@ -111,34 +111,6 @@ NAME_FIXES = {
         "Команда Навального": "Team Navalny", "Команды Навального": "Team Navalny",
         "АСФ": "ACF",
     },
-    "FR": {
-        # Navalny family
-        "Nawalny": "Navalny", "nawalny": "navalny",
-        "Nawalnaja": "Navalnaya", "nawalnaja": "navalnaya",
-        "Навальный": "Navalny", "Навальная": "Navalnaya",
-        "Навального": "Navalny", "Навальной": "Navalnaya",
-        "Навальному": "Navalny",
-        # Volkov
-        "Волков": "Volkov", "Волкова": "Volkov", "Волкову": "Volkov",
-        # Pevchikh
-        "Певчих": "Pevchikh",
-        # Zhdanov
-        "Жданов": "Jdanov", "Жданова": "Jdanov",
-        # Shaveddinov
-        "Шаведдинов": "Chaveddinov", "Шаведдинова": "Chaveddinov",
-        # Yulia
-        "Юлия Навальная": "Ioulia Navalnaya", "Юлии Навальной": "Ioulia Navalnaya",
-        # Organizations
-        "Единая Россия": "Russie unie", "Единой России": "Russie unie",
-        '"Единая Россия"': "\u00ab\u00a0Russie unie\u00a0\u00bb",
-        "«Единая Россия»": "\u00ab\u00a0Russie unie\u00a0\u00bb",
-        "ЕдРо": "Russie unie",
-        "ФБК": "Fondation anti-corruption",
-        "Фонд борьбы с коррупцией": "Fondation anti-corruption",
-        "Фонд Борьбы с Коррупцией": "Fondation anti-corruption",
-        "Команда Навального": "Équipe Navalny", "Команды Навального": "Équipe Navalny",
-        "АСФ": "FCA",
-    },
 }
 
 # ─── Channel display names per language ──────────────────────────────────────
@@ -160,15 +132,6 @@ CHANNEL_NAMES = {
         "anti_edro":               "Anti-United Russia",
         "navalnylivechannel":      "Navalny LIVE",
         "lawfbk":                  "FBK Lawyers",
-        "mariapevchikh":           "Maria Pevchikh",
-    },
-    "FR": {
-        "leonid_volkov":           "Leonid Volkov",
-        "yulia_navalnaya_channel": "Ioulia Navalnaïa",
-        "teamnavalny":             "Équipe Navalny",
-        "anti_edro":               "Anti-Russie unie",
-        "navalnylivechannel":      "Navalny LIVE",
-        "lawfbk":                  "FBK Juristes",
         "mariapevchikh":           "Maria Pevchikh",
     },
 }
@@ -201,9 +164,5 @@ LANGUAGES = [
         source_label="Source",
         part2_label="Part 2",
         channel_name="Navalny English",
-    ),
-        source_label="Source\u00a0",
-        part2_label="Partie 2",
-        channel_name="Navalny Français",
     ),
 ]
