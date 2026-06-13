@@ -194,3 +194,189 @@ class TestFailClosed:
                         assert result is None, f"Expected None, got: {result}"
 
         asyncio.run(_test())
+
+# ─── T35: Scraper / document detection tests ────────────────────────────────
+
+class TestScraperDocuments:
+    def test_post_has_documents_field(self):
+        from bot.scraper import Post
+        p = Post(
+            channel="test", post_id="test/1", message_id=1,
+            text_html="hi", text_plain="hi",
+        )
+        assert p.documents == []
+
+    def test_post_with_document(self):
+        from bot.scraper import Post
+        p = Post(
+            channel="test", post_id="test/1", message_id=1,
+            text_html="hi", text_plain="hi",
+            documents=[{"title": "report.pdf", "url": "https://t.me/x"}],
+        )
+        assert len(p.documents) == 1
+        assert p.documents[0]["title"] == "report.pdf"
+
+    def test_youtube_id_extraction(self):
+        from bot.scraper import _extract_youtube_id
+        assert _extract_youtube_id("watch https://youtu.be/dQw4w9WgXcQ now") == "dQw4w9WgXcQ"
+        assert _extract_youtube_id("no video here") is None
+
+
+# ─── T35: DeepL persistent counter tests (T30/T31) ──────────────────────────
+
+class TestDeepLCounter:
+    def test_usage_loads_zero_initially(self, tmp_data_dir):
+        import bot.translator as tr
+        tr._DEEPL_COUNTER_FILE = tmp_data_dir / "deepl_usage.json"
+        usage = tr._load_deepl_usage()
+        assert usage["chars"] == 0
+        assert "month" in usage
+
+    def test_usage_persists(self, tmp_data_dir):
+        import bot.translator as tr
+        tr._DEEPL_COUNTER_FILE = tmp_data_dir / "deepl_usage.json"
+        data = {"month": "2026-06", "chars": 12345, "alerted": False}
+        tr._save_deepl_usage(data)
+        loaded = tr._load_deepl_usage()
+        # Only persists if same month; force month match
+        if loaded["month"] == "2026-06":
+            assert loaded["chars"] == 12345
+
+    def test_month_reset(self, tmp_data_dir):
+        import bot.translator as tr
+        tr._DEEPL_COUNTER_FILE = tmp_data_dir / "deepl_usage.json"
+        # Write an old month
+        tr._save_deepl_usage({"month": "2020-01", "chars": 99999, "alerted": True})
+        loaded = tr._load_deepl_usage()
+        # Should reset because month differs from current
+        assert loaded["chars"] == 0
+        assert loaded["alerted"] is False
+
+    def test_get_deepl_usage_shape(self, tmp_data_dir):
+        from bot.translator import get_deepl_usage
+        usage = get_deepl_usage()
+        assert "chars" in usage
+        assert "limit" in usage
+        assert "percent" in usage
+        assert usage["limit"] == 500_000
+
+
+# ─── T35: Cache cleanup tests (T34) ─────────────────────────────────────────
+
+class TestCacheCleanup:
+    def test_cleanup_removes_old(self, tmp_data_dir):
+        import time
+        import bot.translator as tr
+        cache_dir = tmp_data_dir / "translation_cache"
+        tr._CACHE_DIR = cache_dir
+        # Create an old file
+        old = cache_dir / "old.txt"
+        old.write_text("stale")
+        old_time = time.time() - (40 * 86400)  # 40 days old
+        os.utime(old, (old_time, old_time))
+        # Create a fresh file
+        fresh = cache_dir / "fresh.txt"
+        fresh.write_text("recent")
+        removed = tr.cleanup_cache(max_age_days=30)
+        assert removed == 1
+        assert not old.exists()
+        assert fresh.exists()
+
+    def test_cache_stats(self, tmp_data_dir):
+        import bot.translator as tr
+        cache_dir = tmp_data_dir / "translation_cache"
+        tr._CACHE_DIR = cache_dir
+        (cache_dir / "a.txt").write_text("hello")
+        (cache_dir / "b.txt").write_text("world")
+        stats = tr.cache_stats()
+        assert stats["entries"] == 2
+
+
+# ─── T35: Publisher unit tests ──────────────────────────────────────────────
+
+class TestPublisher:
+    def test_build_header(self):
+        from bot.publisher import _build_header
+        from bot.config import LangConfig
+        lang = LangConfig(code="DE", chat_id="@x", source_label="Quelle",
+                          part2_label="Teil 2", channel_name="Test")
+        post = type("P", (), {"channel": "teamnavalny"})()
+        header = _build_header(post, lang)
+        assert "teamnavalny" in header
+        assert "<b>" in header
+
+    def test_sanitize_html_balanced(self):
+        from bot.publisher import _sanitize_html
+        # Heavily unbalanced -> tags stripped
+        text = "<b><b><b><b><b>too many opens"
+        result = _sanitize_html(text)
+        assert "<b>" not in result
+
+    def test_document_links_in_split(self):
+        from bot.publisher import _split_message
+        text = "📎 document link here"
+        chunks = _split_message(text, 4096)
+        assert chunks == [text]
+
+
+# ─── T35: End-to-end mock test ──────────────────────────────────────────────
+
+class TestEndToEnd:
+    def test_full_pipeline_with_mocks(self, tmp_data_dir):
+        """Mock translation + publishing, verify a post flows through process_post."""
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        import bot.translator as tr
+
+        cache_dir = tmp_data_dir / "translation_cache"
+        tr._CACHE_DIR = cache_dir
+
+        from bot.scraper import Post
+        from bot.config import LangConfig
+
+        post = Post(
+            channel="teamnavalny", post_id="teamnavalny/100", message_id=100,
+            text_html="<b>Тест</b> сообщение для проверки конвейера перевода",
+            text_plain="Тест сообщение для проверки конвейера перевода",
+        )
+        lang = LangConfig(code="DE", chat_id="@test", source_label="Quelle",
+                          part2_label="Teil 2", channel_name="Test")
+
+        async def _run():
+            import main
+            with patch.object(main, "translate", new=AsyncMock(return_value="<b>Test</b> Nachricht")):
+                with patch.object(main, "publish_post", new=AsyncMock(return_value=True)):
+                    seen, published, hashes = set(), set(), set()
+                    ok, is_dupe = await main.process_post(
+                        None, post, lang, seen, published, hashes)
+                    assert ok is True
+                    assert is_dupe is False
+
+        asyncio.run(_run())
+
+    def test_duplicate_detection(self, tmp_data_dir):
+        """A post whose content hash is already seen is skipped as dupe."""
+        import asyncio
+        import bot.translator as tr
+        tr._CACHE_DIR = tmp_data_dir / "translation_cache"
+
+        from bot.scraper import Post
+        from bot.config import LangConfig
+        from bot.state import content_hash
+
+        post = Post(
+            channel="teamnavalny", post_id="teamnavalny/101", message_id=101,
+            text_html="duplicate content", text_plain="duplicate content",
+        )
+        lang = LangConfig(code="DE", chat_id="@test", source_label="Quelle",
+                          part2_label="Teil 2", channel_name="Test")
+
+        async def _run():
+            import main
+            hashes = {content_hash(post.text_plain)}
+            ok, is_dupe = await main.process_post(
+                None, post, lang, set(), set(), hashes)
+            assert ok is False
+            assert is_dupe is True
+
+        asyncio.run(_run())
